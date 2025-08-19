@@ -1,26 +1,41 @@
 <?xml version="1.0" encoding="utf-8"?>
-<manifest package="com.twistedphone" xmlns:android="http://schemas.android.com/apk/res/android">
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
     <uses-permission android:name="android.permission.INTERNET"/>
     <uses-permission android:name="android.permission.CAMERA"/>
     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION"/>
     <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION"/>
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
     <uses-permission android:name="android.permission.RECORD_AUDIO"/> <!-- for future, if needed -->
-    <application android:name=".TwistedApp" android:allowBackup="true" android:label="Twisted Phone" android:theme="@style/Theme.AppCompat.Light.NoActionBar">
-        <activity android:name=".onboarding.MainActivity">
+
+    <application
+        android:name=".TwistedApp"
+        android:allowBackup="true"
+        android:label="Twisted Phone"
+        android:theme="@style/Theme.AppCompat.Light.NoActionBar">
+
+        <!-- Launcher activity must be exported -->
+        <activity
+            android:name=".onboarding.MainActivity"
+            android:exported="true">
             <intent-filter>
-                <action android:name="android.intent.action.MAIN"/> <category android:name="android.intent.category.LAUNCHER"/>
+                <action android:name="android.intent.action.MAIN"/>
+                <category android:name="android.intent.category.LAUNCHER"/>
             </intent-filter>
         </activity>
-        <activity android:name=".home.FakeHomeActivity"/>
-        <activity android:name=".browser.WebViewActivity"/>
-        <activity android:name=".camera.CameraActivity"/>
-        <activity android:name=".messages.WhosAppActivity"/>
-        <activity android:name=".messages.MessagesActivity"/>
-        <activity android:name=".gallery.GalleryActivity"/>
-        <activity android:name=".settings.SettingsActivity"/>
-        <receiver android:name=".alt.AltMessageReceiver"/>
-        <receiver android:name=".alt.AltUnlockReceiver"/>
-        <service android:name=".alt.AltMessageService"/>
+
+        <!-- Other activities: no intent-filters, so not exported -->
+        <activity android:name=".home.FakeHomeActivity" android:exported="false"/>
+        <activity android:name=".browser.WebViewActivity" android:exported="false"/>
+        <activity android:name=".camera.CameraActivity" android:exported="false"/>
+        <activity android:name=".messages.WhosAppActivity" android:exported="false"/>
+        <activity android:name=".messages.MessagesActivity" android:exported="false"/>
+        <activity android:name=".gallery.GalleryActivity" android:exported="false"/>
+        <activity android:name=".settings.SettingsActivity" android:exported="false"/>
+
+        <receiver android:name=".alt.AltMessageReceiver" android:exported="false"/>
+        <receiver android:name=".alt.AltUnlockReceiver" android:exported="false"/>
+        <service android:name=".alt.AltMessageService" android:exported="false"/>
+
     </application>
 </manifest>
