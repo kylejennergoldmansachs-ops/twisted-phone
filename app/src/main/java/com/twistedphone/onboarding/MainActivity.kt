@@ -23,6 +23,7 @@ import androidx.work.WorkManager
 import com.twistedphone.R
 import com.twistedphone.TwistedApp
 import com.twistedphone.ai.MistralClient
+import com.twistedphone.alt.AltMessageScheduler // Add this import
 import com.twistedphone.alt.AltUnlockReceiver
 import com.twistedphone.home.FakeHomeActivity
 import kotlinx.coroutines.CoroutineScope
