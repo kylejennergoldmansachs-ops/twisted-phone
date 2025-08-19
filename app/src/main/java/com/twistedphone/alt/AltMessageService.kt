@@ -1,4 +1,5 @@
 package com.twistedphone.alt
+
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
@@ -31,6 +32,7 @@ class AltMessageService : Service() {
     private val prefs = TwistedApp.instance.securePrefs
     private val settings = TwistedApp.instance.settingsPrefs
     override fun onBind(intent: Intent?): IBinder? = null
+    
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         val isReply = intent?.getBooleanExtra("is_reply", false) ?: false
         val installTime = prefs.getLong("install_time", 0)
@@ -38,6 +40,7 @@ class AltMessageService : Service() {
         val rng = Random()
         val chance = if (isReply) 1.0 else if (now - installTime > 24 * 60 * 60 * 1000) 0.4 else 0.7
         if (rng.nextDouble() > chance) { stopSelf(); return START_NOT_STICKY }
+        
         scope.launch {
             var msg = ""
             if (now - installTime < 24 * 60 * 60 * 1000 && rng.nextDouble() < 0.5) {
@@ -45,6 +48,7 @@ class AltMessageService : Service() {
             } else {
                 val history = MessageStore.recentHistory(applicationContext)
                 var contextHint = "Time: $now"
+                
                 try {
                     val locProvider = LocationServices.getFusedLocationProviderClient(applicationContext)
                     val loc = try {
@@ -52,6 +56,7 @@ class AltMessageService : Service() {
                     } catch (e: Exception) { null }
                     if (loc != null) contextHint += " Location: ${loc.latitude},${loc.longitude}"
                 } catch (_: Exception) {}
+                
                 if (settings.getBoolean("camera_context", false)) {
                     val thumbnail = captureThumbnail()
                     if (thumbnail != null) {
@@ -60,9 +65,11 @@ class AltMessageService : Service() {
                         if (desc.isNotBlank()) contextHint += " Scene: $desc"
                     }
                 }
+                
                 val client = MistralClient()
                 msg = client.generateAltMessage(contextHint, history)
             }
+            
             if (msg.isNotBlank()) {
                 MessageStore.addMessage(applicationContext, "ALT", msg)
                 showNotification(msg)
@@ -71,40 +78,44 @@ class AltMessageService : Service() {
         }
         return START_NOT_STICKY
     }
+    
     private fun generateGibberish(): String {
         val chars = "abcdefghijklmnopqrstuvwxyz1234567890!@#$%^&*()".toCharArray()
         return (1..20).map { chars.random() }.joinToString("")
     }
+    
     private suspend fun captureThumbnail(): String? = withContext(Dispatchers.IO) {
-    val providerFuture = ProcessCameraProvider.getInstance(applicationContext)
-    val provider = try {
-        providerFuture.get(10, TimeUnit.SECONDS)
-    } catch (e: Exception) {
-        e.printStackTrace()
-        return@withContext null
-    }
-    
-    val imageCapture = ImageCapture.Builder().setTargetResolution(android.util.Size(128, 128)).build()
-    provider.bindToLifecycle(null, CameraSelector.DEFAULT_FRONT_CAMERA, imageCapture)
-    var b64: String? = null
-    val tempFile = File.createTempFile("thumbnail", ".jpg", cacheDir)
-    val output = ImageCapture.OutputFileOptions.Builder(tempFile).build()
-    
-    imageCapture.takePicture(output, ContextCompat.getMainExecutor(applicationContext), object : ImageCapture.OnImageSavedCallback {
-        override fun onImageSaved(output: ImageCapture.OutputFileResults) {
-            val bmp = android.graphics.BitmapFactory.decodeFile(tempFile.absolutePath)
-            val baos = java.io.ByteArrayOutputStream(); bmp.compress(Bitmap.CompressFormat.JPEG, 50, baos)
-            b64 = Base64.encodeToString(baos.toByteArray(), Base64.NO_WRAP)
-            tempFile.delete()
+        try {
+            // Start the camera capture activity
+            val intent = Intent(applicationContext, CameraCaptureActivity::class.java)
+            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            applicationContext.startActivity(intent)
+            
+            // Wait for the result using a broadcast receiver
+            val latch = java.util.concurrent.CountDownLatch(1)
+            var result: String? = null
+            
+            val receiver = object : android.content.BroadcastReceiver() {
+                override fun onReceive(context: Context, intent: Intent) {
+                    result = intent.getStringExtra("thumbnail")
+                    latch.countDown()
+                }
+            }
+            
+            applicationContext.registerReceiver(receiver, 
+                android.content.IntentFilter("CAMERA_CAPTURE_RESULT"))
+            
+            // Wait for result with timeout
+            latch.await(10, TimeUnit.SECONDS)
+            applicationContext.unregisterReceiver(receiver)
+            
+            result
+        } catch (e: Exception) {
+            e.printStackTrace()
+            null
         }
-        override fun onError(exc: ImageCaptureException) {}
-    })
-    
-    delay(2000) // wait for capture
-    provider.unbindAll()
-    b64
-    
     }
+    
     private fun showNotification(text: String) {
         val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
         val chId = "altch"
@@ -112,8 +123,17 @@ class AltMessageService : Service() {
         nm.createNotificationChannel(ch)
         val intent = Intent(this, com.twistedphone.messages.MessagesActivity::class.java)
         val pi = PendingIntent.getActivity(this, 0, intent, PendingIntent.FLAG_IMMUTABLE)
-        val n = NotificationCompat.Builder(this, chId).setContentTitle("Message from someone...").setContentText(text).setContentIntent(pi).setSmallIcon(android.R.drawable.ic_dialog_info).build()
+        val n = NotificationCompat.Builder(this, chId)
+            .setContentTitle("Message from someone...")
+            .setContentText(text)
+            .setContentIntent(pi)
+            .setSmallIcon(android.R.drawable.ic_dialog_info)
+            .build()
         nm.notify((System.currentTimeMillis() % 10000).toInt(), n)
     }
-    override fun onDestroy() { super.onDestroy(); scope.cancel() }
+    
+    override fun onDestroy() { 
+        super.onDestroy() 
+        scope.cancel() 
+    }
 }
