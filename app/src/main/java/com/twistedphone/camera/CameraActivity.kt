@@ -98,14 +98,14 @@ class CameraActivity : AppCompatActivity() {
 
     private fun processImage(image: ImageProxy) {
         if (useEnhanced) {
-            val bitmap = image.toBitmap()
+            val bitmap = image.toBitmap() ?: return
             // MiDaS depth
             midasInterpreter?.let { interpreter ->
                 val input = TensorImage.fromBitmap(bitmap.scale(256, 256))
                 val outputs = Array(1) { FloatArray(256 * 256) }
                 interpreter.run(arrayOf(input.buffer), outputs)
                 depthMap = TensorBuffer.createFixedSize(intArrayOf(1, 256, 256, 1), org.tensorflow.lite.DataType.FLOAT32)
-                depthMap.loadArray(outputs[0])
+                depthMap?.loadArray(outputs[0])
             }
             // Pose detection
             poseDetector?.let { detector ->
@@ -141,7 +141,7 @@ class CameraActivity : AppCompatActivity() {
         return out
     }
 
-    inner class WarpRenderer(private val ctx: Context) : GLSurfaceView.Renderer, Preview.SurfaceProvider {
+    inner class WarpRenderer(private val ctx: Context) : GLSurfaceView.Renderer {
         private var program = 0
         private var textureId = 0
         private val mvpMatrix = FloatArray(16)
@@ -159,16 +159,6 @@ class CameraActivity : AppCompatActivity() {
             GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_WRAP_S, GLES20.GL_CLAMP_TO_EDGE)
             GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_CLAMP_TO_EDGE)
             surfaceTexture = SurfaceTexture(textureId)
-            // Bind to preview
-            previewView.surfaceProvider = this
-        }
-
-        override fun previewFrameRequestStart() {
-            // Start preview
-        }
-
-        override fun previewFrameRequestEnd() {
-            // End preview
         }
 
         override fun onSurfaceCreated(gl: GL10?, config: EGLConfig?) {
@@ -185,7 +175,7 @@ class CameraActivity : AppCompatActivity() {
         override fun onDrawFrame(gl: GL10?) {
             surfaceTexture?.updateTexImage()
             GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT or GLES20.GL_DEPTH_BUFFER_BIT)
-            Matrix.setLookAtM(viewMatrix, 0, 0f, 0f, 3f, 0f, 0f, 0f, 0f, 0f, 1f, 0f)
+            Matrix.setLookAtM(viewMatrix, 0, 0f, 0f, 3f, 0f, 0f, 0f, 0f, 1f, 0f)
             Matrix.multiplyMM(mvpMatrix, 0, projMatrix, 0, viewMatrix, 0)
             GLES20.glUseProgram(program)
             val timeLoc = GLES20.glGetUniformLocation(program, "time")
