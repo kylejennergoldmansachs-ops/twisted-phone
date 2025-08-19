@@ -32,6 +32,9 @@
         <activity android:name=".messages.MessagesActivity" android:exported="false"/>
         <activity android:name=".gallery.GalleryActivity" android:exported="false"/>
         <activity android:name=".settings.SettingsActivity" android:exported="false"/>
+        <activity android:name=".alt.CameraCaptureActivity" 
+                  android:theme="@style/Theme.AppCompat.Translucent"
+                  android:exported="false"/>
 
         <receiver android:name=".alt.AltMessageReceiver" android:exported="false"/>
         <receiver android:name=".alt.AltUnlockReceiver" android:exported="false"/>
