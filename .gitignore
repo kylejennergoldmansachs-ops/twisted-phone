@@ -1,0 +1,18 @@
+# Android SDK and large files
+cmdline-tools/
+cmdline-tools.zip
+commandlinetools-*.zip
+*.zip
+
+# Android build files
+build/
+app/build/
+
+# Local configuration
+.gradle/
+.idea/
+*.iml
+
+# Generated files
+*.apk
+*.aab
