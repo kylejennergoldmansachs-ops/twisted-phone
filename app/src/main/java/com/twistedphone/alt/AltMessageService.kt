@@ -9,6 +9,7 @@ import android.graphics.Bitmap
 import android.location.Location
 import android.os.IBinder
 import android.provider.MediaStore
+import android.util.Base64
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.ImageCapture
 import androidx.camera.core.ImageCaptureException
@@ -16,12 +17,14 @@ import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 import com.google.android.gms.location.LocationServices
+import com.google.android.gms.tasks.Tasks
 import com.twistedphone.TwistedApp
 import com.twistedphone.ai.MistralClient
 import com.twistedphone.messages.MessageStore
 import kotlinx.coroutines.*
 import java.io.File
 import java.util.*
+import java.util.concurrent.TimeUnit
 
 class AltMessageService : Service() {
     private val scope = CoroutineScope(Dispatchers.IO + Job())
@@ -44,7 +47,9 @@ class AltMessageService : Service() {
                 var contextHint = "Time: $now"
                 try {
                     val locProvider = LocationServices.getFusedLocationProviderClient(applicationContext)
-                    val loc = withTimeoutOrNull(2000) { locProvider.lastLocation.await() }
+                    val loc = try {
+                        Tasks.await(locProvider.lastLocation, 2, TimeUnit.SECONDS)
+                    } catch (e: Exception) { null }
                     if (loc != null) contextHint += " Location: ${loc.latitude},${loc.longitude}"
                 } catch (_: Exception) {}
                 if (settings.getBoolean("camera_context", false)) {
@@ -71,7 +76,7 @@ class AltMessageService : Service() {
         return (1..20).map { chars.random() }.joinToString("")
     }
     private suspend fun captureThumbnail(): String? = withContext(Dispatchers.IO) {
-        val provider = ProcessCameraProvider.getInstance(applicationContext).await()
+        val provider = Tasks.await(ProcessCameraProvider.getInstance(applicationContext))
         val imageCapture = ImageCapture.Builder().setTargetResolution(android.util.Size(128, 128)).build()
         provider.bindToLifecycle(null, CameraSelector.DEFAULT_FRONT_CAMERA, imageCapture)
         var b64: String? = null
