@@ -1,4 +1,6 @@
 package com.twistedphone.home
+
+import android.content.Context
 import android.content.Intent
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
@@ -6,10 +8,15 @@ import android.graphics.drawable.BitmapDrawable
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.view.LayoutInflater
 import android.view.View
+import android.view.ViewGroup
+import android.widget.BaseAdapter
 import android.widget.GridView
 import android.widget.ImageButton
+import android.widget.ImageView
 import android.widget.TextView
+import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
 import com.twistedphone.R
 import com.twistedphone.TwistedApp
@@ -19,7 +26,8 @@ import com.twistedphone.gallery.GalleryActivity
 import com.twistedphone.messages.MessagesActivity
 import com.twistedphone.messages.WhosAppActivity
 import com.twistedphone.settings.SettingsActivity
-import java.util.*
+import java.util.Calendar
+import java.util.Random
 
 class FakeHomeActivity : AppCompatActivity() {
     private lateinit var clock: TextView
@@ -86,7 +94,7 @@ class FakeHomeActivity : AppCompatActivity() {
             if (isAppUnlocked(appName)) {
                 startActivity(apps[pos].intent)
             } else {
-                android.widget.Toast.makeText(this, "$appName is locked. Wait for unlock.", android.widget.Toast.LENGTH_SHORT).show()
+                Toast.makeText(this, "$appName is locked. Wait for unlock.", Toast.LENGTH_SHORT).show()
             }
         }
         
@@ -96,7 +104,7 @@ class FakeHomeActivity : AppCompatActivity() {
     }
     
     private fun isAppUnlocked(app: String): Boolean {
-        return prefs.getBoolean("unlock_$app", if(app == "Browser") true else false)
+        return prefs.getBoolean("unlock_$app", app == "Browser")
     }
     
     override fun onResume() { 
@@ -111,7 +119,7 @@ class FakeHomeActivity : AppCompatActivity() {
     
     data class AppInfo(val name: String, val intent: Intent, val iconRes: Int)
     
-    class AppAdapter(context: Context, private val apps: List<AppInfo>) : android.widget.BaseAdapter() {
+    class AppAdapter(context: Context, private val apps: List<AppInfo>) : BaseAdapter() {
         private val inflater = LayoutInflater.from(context)
         
         override fun getCount(): Int = apps.size
