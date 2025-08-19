@@ -18,7 +18,7 @@ class MessagesActivity : AppCompatActivity() {
         val container = findViewById<LinearLayout>(R.id.messagesContainer)
         val msgs = MessageStore.allMessages(this)
         for (m in msgs) {
-            val parts = m.split("|", 3)
+            val parts = m.split("|", limit = 3)
             val who = parts[0]; val text = parts.getOrNull(2) ?: ""
             val tv = TextView(this)
             tv.text = if (who == "YOU") "You: $text" else "ALT: $text"
