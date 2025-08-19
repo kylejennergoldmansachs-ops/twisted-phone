@@ -119,7 +119,7 @@ class MainActivity : AppCompatActivity() {
     
     private fun startHome() {
         prefs.edit().putLong("install_time", System.currentTimeMillis()).apply()
-        scheduleUnlocks()
+        AltMessageScheduler.scheduleUnlocks(this)
         startActivity(Intent(this, FakeHomeActivity::class.java))
         finish()
     }
