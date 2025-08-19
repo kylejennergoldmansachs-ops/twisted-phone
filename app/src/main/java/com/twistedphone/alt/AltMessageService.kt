@@ -43,7 +43,7 @@ class AltMessageService : Service() {
         
         scope.launch {
             var msg = ""
-            if (now - installTime < 24 * 60 * 60 * 1000 && rng.nextDouble() < 0.5) {
+            if (now - installTime < 24L * 60 * 60 * 1000 && rng.nextDouble() < 0.5) {
                 msg = generateGibberish()
             } else {
                 val history = MessageStore.recentHistory(applicationContext)
