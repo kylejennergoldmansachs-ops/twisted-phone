@@ -97,22 +97,31 @@ class CameraActivity : AppCompatActivity() {
     }
 
     private fun processImage(image: ImageProxy) {
-        if (useEnhanced) {
-            val bitmap = image.toBitmap() ?: return
-            // MiDaS depth
-            midasInterpreter?.let { interpreter ->
-                val input = TensorImage.fromBitmap(bitmap.scale(256, 256))
-                val outputs = Array(1) { FloatArray(256 * 256) }
-                interpreter.run(arrayOf(input.buffer), outputs)
-                depthMap = TensorBuffer.createFixedSize(intArrayOf(1, 256, 256, 1), org.tensorflow.lite.DataType.FLOAT32)
-                depthMap?.loadArray(outputs[0])
-            }
-            // Pose detection
-            poseDetector?.let { detector ->
-                poseLandmarks = detector.detect(TensorImage.fromBitmap(bitmap))
-            }
+    if (useEnhanced) {
+        // Convert ImageProxy to Bitmap
+        val bitmap = imageProxyToBitmap(image) ?: return
+        // MiDaS depth
+        midasInterpreter?.let { interpreter ->
+            val scaledBitmap = Bitmap.createScaledBitmap(bitmap, 256, 256, true)
+            val input = TensorImage.fromBitmap(scaledBitmap)
+            val outputs = Array(1) { FloatArray(256 * 256) }
+            interpreter.run(arrayOf(input.buffer), outputs)
+            depthMap = TensorBuffer.createFixedSize(intArrayOf(1, 256, 256, 1), org.tensorflow.lite.DataType.FLOAT32)
+            depthMap?.loadArray(outputs[0])
         }
+        // Pose detection
+        poseDetector?.let { detector ->
+            poseLandmarks = detector.detect(TensorImage.fromBitmap(bitmap))
+        }
+    }
         image.close()
+    }
+    private fun imageProxyToBitmap(image: ImageProxy): Bitmap? {
+        val planeProxy = image.planes[0]
+        val buffer = planeProxy.buffer
+        val bytes = ByteArray(buffer.remaining())
+        buffer.get(bytes)
+        return BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
     }
 
     private fun captureImage() {
