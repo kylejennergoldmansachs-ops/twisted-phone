@@ -1,16 +1,11 @@
-buildscript {
-    repositories {
-        google()
-        mavenCentral()
-    }
-    dependencies {
-        classpath "com.android.tools.build:gradle:8.4.0"
-        classpath "org.jetbrains.kotlin:kotlin-gradle-plugin:1.9.23"
-    }
+/*
+ Minimal root build.gradle - repositories are defined in settings.gradle
+ Keep root build file minimal to avoid repository conflicts with settings.gradle
+*/
+plugins {
+  // No root plugins needed; modules define theirs
 }
-allprojects {
-    repositories {
-        google()
-        mavenCentral()
-    }
+
+task clean(type: Delete) {
+  delete rootProject.buildDir
 }
