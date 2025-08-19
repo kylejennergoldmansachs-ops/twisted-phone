@@ -4,6 +4,7 @@ import android.graphics.Canvas
 import android.graphics.Paint
 import android.graphics.Rect
 import android.util.Base64
+import com.google.android.gms.tasks.Tasks
 import com.google.mlkit.vision.common.InputImage
 import com.google.mlkit.vision.face.FaceDetection
 import com.google.mlkit.vision.face.FaceDetectorOptions
@@ -17,6 +18,7 @@ import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONObject
 import java.io.ByteArrayOutputStream
 import java.net.URL
+import java.util.concurrent.TimeUnit
 
 class MistralClient {
     private val client = OkHttpClient()
@@ -76,12 +78,11 @@ class MistralClient {
         val newBmp = bmp.copy(Bitmap.Config.ARGB_8888, true)
         val canvas = Canvas(newBmp)
         val paint = Paint().apply { color = 0xAA000000.toInt() }
-        detector.process(image).addOnSuccessListener { faces ->
-            for (face in faces) {
-                val bounds = face.boundingBox
-                canvas.drawRect(Rect(bounds.left, bounds.top, bounds.right, bounds.bottom), paint)
-            }
-        }.await()
+        val result = Tasks.await(detector.process(image))
+        for (face in result) {
+            val bounds = face.boundingBox
+            canvas.drawRect(Rect(bounds.left, bounds.top, bounds.right, bounds.bottom), paint)
+        }
         newBmp
     }
     suspend fun generateAltMessage(contextHint: String, history: String): String = withContext(Dispatchers.IO) {
