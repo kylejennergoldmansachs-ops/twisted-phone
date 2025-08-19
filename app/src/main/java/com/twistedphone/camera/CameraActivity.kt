@@ -1,3 +1,4 @@
+import android.graphics.BitmapFactory
 package com.twistedphone.camera
 import android.content.Context
 import android.graphics.Bitmap
