@@ -17,6 +17,7 @@ import android.widget.ProgressBar
 import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
 import androidx.work.Constraints
+import androidx.work.Data
 import androidx.work.NetworkType
 import androidx.work.OneTimeWorkRequestBuilder
 import androidx.work.WorkManager
@@ -51,6 +52,7 @@ class MainActivity : AppCompatActivity() {
         setContentView(R.layout.activity_main)
         val name = findViewById<EditText>(R.id.nameInput)
         val api = findViewById<EditText>(R.id.apiInput)
+        val huggingfaceInput = findViewById<EditText>(R.id.huggingfaceInput)
         val pix = findViewById<EditText>(R.id.pixtralInput)
         val textAgent = findViewById<EditText>(R.id.textAgentInput)
         pix.setText("ag:ddacd900:20250418:untitled-agent:8dfc3563")
@@ -61,9 +63,10 @@ class MainActivity : AppCompatActivity() {
         
         findViewById<Button>(R.id.btnStart).setOnClickListener {
             val n = name.text.toString().trim(); val k = api.text.toString().trim()
+            val hfToken = huggingfaceInput.text.toString().trim()
             val p = pix.text.toString().trim(); val t = textAgent.text.toString().trim()
             if(n.isNotEmpty() && k.isNotEmpty()) {
-                prefs.edit().putString("player_name", n).putString("mistral_key", k).putString("pix_agent", p).putString("text_agent", t).apply()
+                prefs.edit().putString("player_name", n).putString("mistral_key", k).putString("huggingface_token", hfToken).putString("pix_agent", p).putString("text_agent", t).apply()
                 // take selfie
                 startActivityForResult(Intent(MediaStore.ACTION_IMAGE_CAPTURE), REQ_SELFIE)
             }
@@ -100,14 +103,21 @@ class MainActivity : AppCompatActivity() {
     }
     
     private fun downloadModels() {
-        val huggingfaceToken = findViewById<EditText>(R.id.huggingfaceInput).text.toString().trim()
+        val huggingfaceToken = prefs.getString("huggingface_token", "") ?: ""
         progress.visibility = View.VISIBLE
         loadingText.text = "Downloading models..."
         val constraints = Constraints.Builder().setRequiredNetworkType(NetworkType.CONNECTED).build()
+        
+        // Create input data for the worker
+        val inputData = Data.Builder()
+            .putString("HUGGINGFACE_TOKEN", huggingfaceToken)
+            .build()
+            
         val work = OneTimeWorkRequestBuilder<ModelDownloadWorker>()
             .setConstraints(constraints)
-            .setInputData(workDataOf("HUGGINGFACE_TOKEN" to huggingfaceToken))
+            .setInputData(inputData)
             .build()
+            
         WorkManager.getInstance(this).enqueue(work)
         WorkManager.getInstance(this).getWorkInfoByIdLiveData(work.id).observe(this) { info ->
             if(info.state.isFinished) {
