@@ -76,24 +76,34 @@ class AltMessageService : Service() {
         return (1..20).map { chars.random() }.joinToString("")
     }
     private suspend fun captureThumbnail(): String? = withContext(Dispatchers.IO) {
-        val provider = Tasks.await(ProcessCameraProvider.getInstance(applicationContext))
-        val imageCapture = ImageCapture.Builder().setTargetResolution(android.util.Size(128, 128)).build()
-        provider.bindToLifecycle(null, CameraSelector.DEFAULT_FRONT_CAMERA, imageCapture)
-        var b64: String? = null
-        val tempFile = File.createTempFile("thumbnail", ".jpg", cacheDir)
-        val output = ImageCapture.OutputFileOptions.Builder(tempFile).build()
-        imageCapture.takePicture(output, ContextCompat.getMainExecutor(applicationContext), object : ImageCapture.OnImageSavedCallback {
-            override fun onImageSaved(output: ImageCapture.OutputFileResults) {
-                val bmp = android.graphics.BitmapFactory.decodeFile(tempFile.absolutePath)
-                val baos = java.io.ByteArrayOutputStream(); bmp.compress(Bitmap.CompressFormat.JPEG, 50, baos)
-                b64 = Base64.encodeToString(baos.toByteArray(), Base64.NO_WRAP)
-                tempFile.delete()
-            }
-            override fun onError(exc: ImageCaptureException) {}
-        })
-        delay(2000) // wait for capture
-        provider.unbindAll()
-        b64
+    val providerFuture = ProcessCameraProvider.getInstance(applicationContext)
+    val provider = try {
+        providerFuture.get(10, TimeUnit.SECONDS)
+    } catch (e: Exception) {
+        e.printStackTrace()
+        return@withContext null
+    }
+    
+    val imageCapture = ImageCapture.Builder().setTargetResolution(android.util.Size(128, 128)).build()
+    provider.bindToLifecycle(null, CameraSelector.DEFAULT_FRONT_CAMERA, imageCapture)
+    var b64: String? = null
+    val tempFile = File.createTempFile("thumbnail", ".jpg", cacheDir)
+    val output = ImageCapture.OutputFileOptions.Builder(tempFile).build()
+    
+    imageCapture.takePicture(output, ContextCompat.getMainExecutor(applicationContext), object : ImageCapture.OnImageSavedCallback {
+        override fun onImageSaved(output: ImageCapture.OutputFileResults) {
+            val bmp = android.graphics.BitmapFactory.decodeFile(tempFile.absolutePath)
+            val baos = java.io.ByteArrayOutputStream(); bmp.compress(Bitmap.CompressFormat.JPEG, 50, baos)
+            b64 = Base64.encodeToString(baos.toByteArray(), Base64.NO_WRAP)
+            tempFile.delete()
+        }
+        override fun onError(exc: ImageCaptureException) {}
+    })
+    
+    delay(2000) // wait for capture
+    provider.unbindAll()
+    b64
+    
     }
     private fun showNotification(text: String) {
         val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
