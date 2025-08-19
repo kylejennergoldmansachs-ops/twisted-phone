@@ -1,7 +1,8 @@
-import android.graphics.BitmapFactory
 package com.twistedphone.camera
+
 import android.content.Context
 import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.graphics.SurfaceTexture
 import android.opengl.GLES11Ext
 import android.opengl.GLES20
@@ -98,28 +99,29 @@ class CameraActivity : AppCompatActivity() {
     }
 
     private fun processImage(image: ImageProxy) {
-    if (useEnhanced) {
-        // Convert ImageProxy to Bitmap
-        val bitmap = imageProxyToBitmap(image) ?: return
-        // MiDaS depth
-        midasInterpreter?.let { interpreter ->
-            val scaledBitmap = Bitmap.createScaledBitmap(bitmap, 256, 256, true)
-            val input = TensorImage.fromBitmap(scaledBitmap)
-            val outputs = Array(1) { FloatArray(256 * 256) }
-            interpreter.run(arrayOf(input.buffer), outputs)
-            depthMap = TensorBuffer.createFixedSize(intArrayOf(1, 256, 256, 1), org.tensorflow.lite.DataType.FLOAT32)
-            depthMap?.loadArray(outputs[0])
+        if (useEnhanced) {
+            val bitmap = imageProxyToBitmap(image) ?: return
+            // MiDaS depth
+            midasInterpreter?.let { interpreter ->
+                val scaledBitmap = Bitmap.createScaledBitmap(bitmap, 256, 256, true)
+                val input = TensorImage.fromBitmap(scaledBitmap)
+                val outputs = Array(1) { FloatArray(256 * 256) }
+                interpreter.run(arrayOf(input.buffer), outputs)
+                depthMap = TensorBuffer.createFixedSize(intArrayOf(1, 256, 256, 1), org.tensorflow.lite.DataType.FLOAT32)
+                depthMap?.loadArray(outputs[0])
+            }
+            // Pose detection
+            poseDetector?.let { detector ->
+                poseLandmarks = detector.detect(TensorImage.fromBitmap(bitmap))
+            }
         }
-        // Pose detection
-        poseDetector?.let { detector ->
-            poseLandmarks = detector.detect(TensorImage.fromBitmap(bitmap))
-        }
-    }
         image.close()
     }
+
     private fun imageProxyToBitmap(image: ImageProxy): Bitmap? {
         val planeProxy = image.planes[0]
         val buffer = planeProxy.buffer
+        buffer.rewind()
         val bytes = ByteArray(buffer.remaining())
         buffer.get(bytes)
         return BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
