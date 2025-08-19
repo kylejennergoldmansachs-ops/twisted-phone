@@ -4,6 +4,7 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.util.Base64
+import android.view.View
 import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.TextView
@@ -24,7 +25,7 @@ class WhosAppActivity : AppCompatActivity() {
         val indicator = findViewById<TextView>(R.id.typingIndicator)
         val msgs = MessageStore.allMessages(this)
         for (m in msgs) {
-            val parts = m.split("|", 3)
+            val parts = m.split("|", limit = 3)
             val who = parts[0]; val text = parts.getOrNull(2) ?: ""
             val ll = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = if (who == "ALT") android.view.Gravity.END else android.view.Gravity.START }
             val av = ImageView(this).apply { layoutParams = LinearLayout.LayoutParams(40, 40); setImageBitmap(getAvatar(who)) }
