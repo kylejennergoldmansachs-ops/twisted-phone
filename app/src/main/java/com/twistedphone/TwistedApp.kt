@@ -20,7 +20,7 @@ class TwistedApp : Application() {
         super.onCreate()
         instance = this
         
-        // Initialize encrypted preferences with correct configuration
+        // Initializ encrypted preferences with correct configuration
         try {
             val masterKey = MasterKey.Builder(this)
                 .setKeyScheme(MasterKey.KeyScheme.AES256_GCM)
