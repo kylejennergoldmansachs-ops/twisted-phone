@@ -39,7 +39,7 @@ class WebViewActivity : AppCompatActivity() {
 
     private fun performTransformations(url: String) {
         if (cache.containsKey(url)) {
-            web.evaluateJavascript(cache[url], null)
+            web.evaluateJavascript(cache[url]!!, null)
             progress.visibility = View.GONE
             return
         }
@@ -50,7 +50,7 @@ class WebViewActivity : AppCompatActivity() {
                     while (node && node.nodeType == Node.ELEMENT_NODE) {
                         let sib = node.previousSibling, idx = 1;
                         while (sib) { if (sib.nodeType == Node.ELEMENT_NODE && sib.tagName == node.tagName) idx++; sib = sib.previousSibling; }
-                        path = `/${node.tagName.toLowerCase()}[${idx}]${path}`;
+                        path = '/' + node.tagName.toLowerCase() + '[' + idx + ']' + path;
                         node = node.parentNode;
                     }
                     return path;
@@ -68,9 +68,10 @@ class WebViewActivity : AppCompatActivity() {
             })();
         """
         web.evaluateJavascript(jsExtract) { result ->
+            val nonNullResult = result ?: "{}"
             scope.launch {
                 try {
-                    val jo = JSONObject(result)
+                    val jo = JSONObject(nonNullResult)
                     val texts = jo.optJSONArray("texts") ?: JSONArray()
                     val imgs = jo.optJSONArray("imgs") ?: JSONArray()
                     val highUsage = prefs.getBoolean("high_api_usage", false)
