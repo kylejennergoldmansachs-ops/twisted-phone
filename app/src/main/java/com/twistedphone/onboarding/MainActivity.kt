@@ -100,10 +100,14 @@ class MainActivity : AppCompatActivity() {
     }
     
     private fun downloadModels() {
+        val huggingfaceToken = findViewById<EditText>(R.id.huggingfaceInput).text.toString().trim()
         progress.visibility = View.VISIBLE
         loadingText.text = "Downloading models..."
         val constraints = Constraints.Builder().setRequiredNetworkType(NetworkType.CONNECTED).build()
-        val work = OneTimeWorkRequestBuilder<ModelDownloadWorker>().setConstraints(constraints).build()
+        val work = OneTimeWorkRequestBuilder<ModelDownloadWorker>()
+            .setConstraints(constraints)
+            .setInputData(workDataOf("HUGGINGFACE_TOKEN" to huggingfaceToken))
+            .build()
         WorkManager.getInstance(this).enqueue(work)
         WorkManager.getInstance(this).getWorkInfoByIdLiveData(work.id).observe(this) { info ->
             if(info.state.isFinished) {
