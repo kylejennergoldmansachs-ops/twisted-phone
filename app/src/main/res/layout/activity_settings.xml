@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android" android:orientation="vertical" android:padding="16dp" android:layout_width="match_parent" android:layout_height="match_parent">
+  <Switch android:id="@+id/swEnhancedCamera" android:text="Enhanced Camera (AI models)" android:layout_width="match_parent" android:layout_height="wrap_content"/>
+  <Switch android:id="@+id/swApiUsage" android:text="High API Usage (more transforms)" android:layout_width="match_parent" android:layout_height="wrap_content"/>
+  <Switch android:id="@+id/swCameraContext" android:text="Allow AltSelf Camera Context (privacy warning)" android:layout_width="match_parent" android:layout_height="wrap_content"/>
+  <SeekBar android:id="@+id/seekAggressiveness" android:layout_width="match_parent" android:layout_height="wrap_content" android:max="3" android:progress="1"/>
+</LinearLayout>

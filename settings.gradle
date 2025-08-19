@@ -1,0 +1,26 @@
+pluginManagement {
+    repositories {
+        gradlePluginPortal()
+        google()
+        mavenCentral()
+    }
+    resolutionStrategy {
+        eachPlugin {
+            if (requested.id.id == "com.android.application") {
+                useModule("com.android.tools.build:gradle:8.4.0")
+            }
+            if (requested.id.namespace?.startsWith("org.jetbrains.kotlin") == true) {
+                useModule("org.jetbrains.kotlin:kotlin-gradle-plugin:1.9.23")
+            }
+        }
+    }
+}
+dependencyResolutionManagement {
+    repositoriesMode.set(org.gradle.api.initialization.resolve.RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+    repositories {
+        google()
+        mavenCentral()
+    }
+}
+rootProject.name = "twisted-phone"
+include(":app")

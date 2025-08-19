@@ -1,0 +1,63 @@
+plugins {
+  id 'com.android.application'
+  id 'org.jetbrains.kotlin.android'
+}
+
+android {
+  namespace "com.twistedphone"
+  compileSdk 34
+  defaultConfig {
+    applicationId "com.twistedphone"
+    minSdk 24
+    targetSdk 34
+    versionCode 1
+    versionName "0.1"
+    vectorDrawables.useSupportLibrary = true
+  }
+  buildTypes {
+    release { minifyEnabled false }
+    debug { minifyEnabled false }
+  }
+  compileOptions { sourceCompatibility JavaVersion.VERSION_17; targetCompatibility JavaVersion.VERSION_17 }
+  kotlinOptions { jvmTarget = '17' }
+  buildFeatures { viewBinding true }
+  aaptOptions { noCompress "tflite" }
+}
+
+dependencies {
+  implementation "org.jetbrains.kotlin:kotlin-stdlib:1.9.23"
+  implementation "androidx.core:core-ktx:1.10.1"
+  implementation "androidx.appcompat:appcompat:1.6.1"
+  implementation "com.google.android.material:material:1.9.0"
+  implementation "androidx.constraintlayout:constraintlayout:2.1.4"
+
+  // CameraX
+  implementation "androidx.camera:camera-core:1.2.3"
+  implementation "androidx.camera:camera-camera2:1.2.3"
+  implementation "androidx.camera:camera-lifecycle:1.2.3"
+  implementation "androidx.camera:camera-view:1.2.3"
+
+  // WebView + networking
+  implementation "androidx.webkit:webkit:1.7.0"
+  implementation "com.squareup.okhttp3:okhttp:4.11.0"
+
+  // Encrypted prefs
+  implementation "androidx.security:security-crypto:1.1.0-alpha03"
+
+  // Work manager for downloads
+  implementation "androidx.work:work-runtime-ktx:2.8.1"
+
+  // TensorFlow Lite & MLKit (with GPU delegate)
+  implementation "org.tensorflow:tensorflow-lite:2.14.0"
+  implementation "org.tensorflow:tensorflow-lite-gpu:2.14.0"
+  implementation "org.tensorflow:tensorflow-lite-support:0.4.4"
+  implementation "org.tensorflow:tensorflow-lite-task-vision:0.4.4"
+  implementation "com.google.mlkit:face-detection:16.1.5"
+  implementation "com.google.mlkit:pose-detection:17.0.1"
+
+  // JSON, coroutines
+  implementation "org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3"
+
+  // Location
+  implementation "com.google.android.gms:play-services-location:21.0.1"
+}
