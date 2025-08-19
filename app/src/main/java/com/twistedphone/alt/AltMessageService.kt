@@ -38,7 +38,7 @@ class AltMessageService : Service() {
         val installTime = prefs.getLong("install_time", 0)
         val now = System.currentTimeMillis()
         val rng = Random()
-        val chance = if (isReply) 1.0 else if (now - installTime > 24 * 60 * 60 * 1000) 0.4 else 0.7
+        val chance = if (isReply) 1.0 else if (now - installTime > 24L * 60 * 60 * 1000) 0.4 else 0.7
         if (rng.nextDouble() > chance) { stopSelf(); return START_NOT_STICKY }
         
         scope.launch {
