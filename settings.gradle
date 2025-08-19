@@ -18,9 +18,11 @@ pluginManagement {
 dependencyResolutionManagement {
     repositoriesMode.set(org.gradle.api.initialization.resolve.RepositoriesMode.FAIL_ON_PROJECT_REPOS)
     repositories {
-        google()
+        google()   // Android Support and ML Kit
+        maven { url "https://maven.google.com" }  // explicit Google repository for ML Kit
         mavenCentral()
     }
 }
+
 rootProject.name = "twisted-phone"
 include(":app")
