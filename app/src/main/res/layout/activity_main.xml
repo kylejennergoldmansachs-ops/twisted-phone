@@ -1,13 +1,70 @@
 <?xml version="1.0" encoding="utf-8"?>
-<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
- android:orientation="vertical" android:padding="16dp"
- android:layout_width="match_parent" android:layout_height="match_parent">
-  <EditText android:id="@+id/nameInput" android:hint="Your name" android:layout_width="match_parent" android:layout_height="wrap_content"/>
-  <EditText android:id="@+id/apiInput" android:hint="Mistral API key" android:layout_width="match_parent" android:layout_height="wrap_content"/>
-  <EditText android:id="@+id/pixtralInput" android:hint="Pixtral agent ID (optional)" android:layout_width="match_parent" android:layout_height="wrap_content"/>
-  <EditText android:id="@+id/textAgentInput" android:hint="Text agent ID (optional)" android:layout_width="match_parent" android:layout_height="wrap_content"/>
-  <CheckBox android:id="@+id/skipModels" android:text="Skip model downloads (use fallbacks)" android:layout_width="match_parent" android:layout_height="wrap_content"/>
-  <Button android:id="@+id/btnStart" android:text="Start Twisted Phone" android:layout_width="match_parent" android:layout_height="wrap_content"/>
-  <ProgressBar android:id="@+id/progressModels" android:layout_width="match_parent" android:layout_height="wrap_content" android:visibility="gone"/>
-  <TextView android:id="@+id/loadingText" android:layout_width="match_parent" android:layout_height="wrap_content" android:text="Models will be optionally downloaded on first run."/>
-</LinearLayout>
+<ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:fillViewport="true">
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="vertical"
+        android:padding="16dp">
+
+        <EditText
+            android:id="@+id/nameInput"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:hint="Your name" />
+
+        <EditText
+            android:id="@+id/apiInput"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:hint="Mistral API key"
+            android:inputType="textPassword" />
+
+        <EditText
+            android:id="@+id/huggingfaceInput"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:hint="Huggingface Token (optional)"
+            android:inputType="textPassword" />
+
+        <EditText
+            android:id="@+id/pixtralInput"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:hint="Pixtral agent ID (optional)" />
+
+        <EditText
+            android:id="@+id/textAgentInput"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:hint="Text agent ID (optional)" />
+
+        <CheckBox
+            android:id="@+id/skipModels"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Skip model downloads (use fallbacks)" />
+
+        <Button
+            android:id="@+id/btnStart"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Start Twisted Phone" />
+
+        <ProgressBar
+            android:id="@+id/progressModels"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:visibility="gone" />
+
+        <TextView
+            android:id="@+id/loadingText"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Models will be optionally downloaded on first run." />
+
+    </LinearLayout>
+</ScrollView>
