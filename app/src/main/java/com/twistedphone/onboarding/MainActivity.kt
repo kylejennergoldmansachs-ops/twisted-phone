@@ -1,6 +1,9 @@
 package com.twistedphone.onboarding
 import android.Manifest
 import android.app.Activity
+import android.app.AlarmManager
+import android.app.PendingIntent
+import android.content.Context
 import android.content.Intent
 import android.graphics.Bitmap
 import android.os.Bundle
@@ -20,8 +23,8 @@ import androidx.work.WorkManager
 import com.twistedphone.R
 import com.twistedphone.TwistedApp
 import com.twistedphone.ai.MistralClient
+import com.twistedphone.alt.AltUnlockReceiver
 import com.twistedphone.home.FakeHomeActivity
-import com.twistedphone.alt.AltMessageScheduler
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -34,6 +37,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var progress: ProgressBar
     private lateinit var loadingText: TextView
     private lateinit var skipModels: CheckBox
+    
     override fun onCreate(s: Bundle?) {
         super.onCreate(s)
         setContentView(R.layout.activity_main)
@@ -46,6 +50,7 @@ class MainActivity : AppCompatActivity() {
         progress = findViewById(R.id.progressModels)
         loadingText = findViewById(R.id.loadingText)
         skipModels = findViewById(R.id.skipModels)
+        
         findViewById<Button>(R.id.btnStart).setOnClickListener {
             val n = name.text.toString().trim(); val k = api.text.toString().trim()
             val p = pix.text.toString().trim(); val t = textAgent.text.toString().trim()
@@ -57,6 +62,7 @@ class MainActivity : AppCompatActivity() {
         }
         requestPermissions(arrayOf(Manifest.permission.CAMERA, Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.POST_NOTIFICATIONS), 101)
     }
+    
     override fun onActivityResult(req: Int, res: Int, data: Intent?) {
         super.onActivityResult(req, res, data)
         if(req==REQ_SELFIE && res==Activity.RESULT_OK) {
@@ -77,6 +83,7 @@ class MainActivity : AppCompatActivity() {
             }
         }
     }
+    
     private fun downloadModels() {
         progress.visibility = View.VISIBLE
         loadingText.text = "Downloading models..."
@@ -95,24 +102,24 @@ class MainActivity : AppCompatActivity() {
             }
         }
     }
-    // Add this function to your MainActivity class:
+    
     private fun scheduleUnlocks() {
-    // This is a placeholder function - implement your unlock scheduling logic here
-    // For example:
         val alarmMgr = getSystemService(Context.ALARM_SERVICE) as AlarmManager
         val intent = Intent(this, AltUnlockReceiver::class.java)
         val alarmIntent = PendingIntent.getBroadcast(this, 0, intent, PendingIntent.FLAG_IMMUTABLE)
         
         val triggerTime = System.currentTimeMillis() + (2 * 60 * 60 * 1000) // 2 hours from now
+        
         if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.M) {
             alarmMgr.setExactAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, triggerTime, alarmIntent)
         } else {
             alarmMgr.setExact(AlarmManager.RTC_WAKEUP, triggerTime, alarmIntent)
         }
     }
+    
     private fun startHome() {
         prefs.edit().putLong("install_time", System.currentTimeMillis()).apply()
-        AltMessageScheduler.scheduleUnlocks(this) // extended for timed unlocks
+        scheduleUnlocks()
         startActivity(Intent(this, FakeHomeActivity::class.java))
         finish()
     }
