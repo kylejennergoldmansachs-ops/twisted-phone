@@ -1,8 +1,7 @@
+
 package com.twistedphone
 
 import android.app.Application
-import android.security.keystore.KeyGenParameterSpec
-import android.security.keystore.KeyProperties
 import android.util.Log
 import androidx.security.crypto.EncryptedSharedPreferences
 import androidx.security.crypto.MasterKey
@@ -21,28 +20,26 @@ class TwistedApp : Application() {
         super.onCreate()
         instance = this
         
-        // Initialize encrypted preferences
-        val masterKey = MasterKey.Builder(this)
-            .setKeyGenParameterSpec(
-                KeyGenParameterSpec.Builder(
-                    MasterKey.DEFAULT_MASTER_KEY_ALIAS,
-                    KeyProperties.PURPOSE_ENCRYPT or KeyProperties.PURPOSE_DECRYPT
-                )
-                .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE)
-                .setKeySize(256)
+        // Initialize encrypted preferences with correct configuration
+        try {
+            val masterKey = MasterKey.Builder(this)
+                .setKeyScheme(MasterKey.KeyScheme.AES256_GCM)
                 .build()
-            )
-            .build()
 
-        securePrefs = EncryptedSharedPreferences.create(
-            this,
-            "secure_prefs",
-            masterKey,
-            EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
-            EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM
-        ) as EncryptedSharedPreferences
+            securePrefs = EncryptedSharedPreferences.create(
+                this,
+                "secure_prefs",
+                masterKey,
+                EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
+                EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM
+            ) as EncryptedSharedPreferences
+        } catch (e: Exception) {
+            Log.e("TwistedApp", "Failed to create encrypted preferences: ${e.message}")
+            // Fall back to regular shared preferences
+            securePrefs = getSharedPreferences("secure_prefs", MODE_PRIVATE) as EncryptedSharedPreferences
+        }
 
-        settingsPrefs = getSharedPreferences("settings", android.content.Context.MODE_PRIVATE)
+        settingsPrefs = getSharedPreferences("settings", MODE_PRIVATE)
         
         try {
             AltMessageScheduler.scheduleInitial()
