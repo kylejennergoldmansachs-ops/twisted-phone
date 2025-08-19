@@ -15,6 +15,23 @@ object AltMessageScheduler {
         scheduleAlarm(interval)
     }
 
+    // Add this function to your AltMessageScheduler.kt
+    fun scheduleUnlocks(context: Context) {
+        val alarmMgr = context.getSystemService(Context.ALARM_SERVICE) as AlarmManager
+        val intent = Intent(context, AltUnlockReceiver::class.java)
+        val alarmIntent = PendingIntent.getBroadcast(context, 1, intent, PendingIntent.FLAG_IMMUTABLE)
+        val triggerTime = System.currentTimeMillis() + (2 * 60 * 60 * 1000) // 2 hours from now
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                alarmMgr.setExactAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, triggerTime, alarmIntent)
+            } else {
+                alarmMgr.setExact(AlarmManager.RTC_WAKEUP, triggerTime, alarmIntent)
+            }
+        } catch (e: SecurityException) {
+            Log.e("AltMessageScheduler", "Failed to schedule unlock alarm: ${e.message}")
+        }
+    }
+
     fun scheduleAlarm(interval: Long) {
         val alarmMgr = TwistedApp.instance.getSystemService(Context.ALARM_SERVICE) as AlarmManager
         val intent = Intent(TwistedApp.instance, AltMessageReceiver::class.java)
