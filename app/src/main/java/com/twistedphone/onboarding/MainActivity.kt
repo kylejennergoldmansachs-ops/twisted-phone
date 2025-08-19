@@ -23,7 +23,7 @@ import androidx.work.WorkManager
 import com.twistedphone.R
 import com.twistedphone.TwistedApp
 import com.twistedphone.ai.MistralClient
-import com.twistedphone.alt.AltMessageScheduler // Add this import
+import com.twistedphone.alt.AltMessageScheduler
 import com.twistedphone.alt.AltUnlockReceiver
 import com.twistedphone.home.FakeHomeActivity
 import kotlinx.coroutines.CoroutineScope
@@ -41,6 +41,13 @@ class MainActivity : AppCompatActivity() {
     
     override fun onCreate(s: Bundle?) {
         super.onCreate(s)
+        
+        // Check if setup is already complete
+        if (isSetupComplete()) {
+            startHome()
+            return
+        }
+        
         setContentView(R.layout.activity_main)
         val name = findViewById<EditText>(R.id.nameInput)
         val api = findViewById<EditText>(R.id.apiInput)
@@ -62,6 +69,13 @@ class MainActivity : AppCompatActivity() {
             }
         }
         requestPermissions(arrayOf(Manifest.permission.CAMERA, Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.POST_NOTIFICATIONS), 101)
+    }
+    
+    private fun isSetupComplete(): Boolean {
+        val name = prefs.getString("player_name", "")
+        val key = prefs.getString("mistral_key", "")
+        val selfie = prefs.getString("selfie_b64", "")
+        return name?.isNotEmpty() == true && key?.isNotEmpty() == true && selfie?.isNotEmpty() == true
     }
     
     override fun onActivityResult(req: Int, res: Int, data: Intent?) {
