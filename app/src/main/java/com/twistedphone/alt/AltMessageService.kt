@@ -85,36 +85,36 @@ class AltMessageService : Service() {
     }
     
     private suspend fun captureThumbnail(): String? = withContext(Dispatchers.IO) {
-        try {
-            // Start the camera capture activity
-            val intent = Intent(applicationContext, CameraCaptureActivity::class.java)
-            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-            applicationContext.startActivity(intent)
-            
-            // Wait for the result using a broadcast receiver
-            val latch = java.util.concurrent.CountDownLatch(1)
-            var result: String? = null
-            
-            val receiver = object : android.content.BroadcastReceiver() {
-                override fun onReceive(context: Context, intent: Intent) {
-                    result = intent.getStringExtra("thumbnail")
-                    latch.countDown()
-                }
+    try {
+        // Start the camera capture activity
+        val intent = Intent(applicationContext, CameraCaptureActivity::class.java)
+        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        applicationContext.startActivity(intent)
+        
+        // Wait for the result using a broadcast receiver
+        val latch = java.util.concurrent.CountDownLatch(1)
+        var result: String? = null
+        
+        val receiver = object : android.content.BroadcastReceiver() {
+            override fun onReceive(context: Context, intent: Intent) {
+                result = intent.getStringExtra("thumbnail")
+                latch.countDown()
             }
-            
-            applicationContext.registerReceiver(receiver, 
-                android.content.IntentFilter("CAMERA_CAPTURE_RESULT"))
-            
-            // Wait for result with timeout
-            latch.await(10, TimeUnit.SECONDS)
-            applicationContext.unregisterReceiver(receiver)
-            
-            result
-        } catch (e: Exception) {
-            e.printStackTrace()
-            null
         }
+        
+        applicationContext.registerReceiver(receiver, 
+            android.content.IntentFilter("CAMERA_CAPTURE_RESULT"))
+        
+        // Wait for result with timeout
+        latch.await(10, TimeUnit.SECONDS)
+        applicationContext.unregisterReceiver(receiver)
+        
+        result
+    } catch (e: Exception) {
+        e.printStackTrace()
+        null
     }
+}
     
     private fun showNotification(text: String) {
         val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
