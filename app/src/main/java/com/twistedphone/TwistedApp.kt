@@ -1,20 +1,28 @@
 package com.twistedphone
+
 import android.app.Application
-import androidx.security.crypto.EncryptedSharedPreferences
-import androidx.security.crypto.MasterKey
-import android.content.SharedPreferences
+import android.util.Log
+import com.twistedphone.alt.AltMessageScheduler
 
 class TwistedApp : Application() {
-    companion object { lateinit var instance: TwistedApp; private set }
-    lateinit var securePrefs: SharedPreferences
-    lateinit var settingsPrefs: SharedPreferences
+    companion object {
+        lateinit var instance: TwistedApp
+            private set
+    }
+
+    lateinit var securePrefs: EncryptedSharedPrefs
+    lateinit var settingsPrefs: android.content.SharedPreferences
 
     override fun onCreate() {
         super.onCreate()
         instance = this
-        val mk = MasterKey.Builder(this).setKeyScheme(MasterKey.KeyScheme.AES256_GCM).build()
-        securePrefs = EncryptedSharedPreferences.create(this,"twisted_secure",mk,EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM)
-        settingsPrefs = getSharedPreferences("twisted_settings", MODE_PRIVATE)
-        com.twistedphone.alt.AltMessageScheduler.scheduleInitial(this) // schedule on app create
+        securePrefs = EncryptedSharedPrefs(this)
+        settingsPrefs = getSharedPreferences("settings", android.content.Context.MODE_PRIVATE)
+        
+        try {
+            AltMessageScheduler.scheduleInitial()
+        } catch (e: SecurityException) {
+            Log.e("TwistedApp", "Failed to schedule initial alarm: ${e.message}")
+        }
     }
 }
