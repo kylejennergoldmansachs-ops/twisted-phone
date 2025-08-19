@@ -1,34 +1,82 @@
 name: Build APK
 on: [ push ]
+
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
       - name: Setup JDK 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: 17
+
+      # Install Gradle on the runner (fallback if wrapper or jar is broken)
+      - name: Install Gradle (runner fallback)
+        uses: gradle/gradle-build-action@v3
+        with:
+          gradle-version: 8.7
+
+      # Cache Gradle wrapper & caches to speed subsequent builds
+      - name: Cache Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-cache-${{ runner.os }}-${{ hashFiles('**/gradle/wrapper/gradle-wrapper.properties', '**/*.gradle*') }}
+          restore-keys: |
+            gradle-cache-${{ runner.os }}-
+
       - name: Install Android SDK tools
         env:
           ANDROID_SDK_ROOT: /home/runner/Android/Sdk
         run: |
           set -e
-          mkdir -p /home/runner/Android/Sdk/cmdline-tools
+          mkdir -p $ANDROID_SDK_ROOT/cmdline-tools
           wget -q https://dl.google.com/android/repository/commandlinetools-linux-9477386_latest.zip -O /tmp/cmdline-tools.zip
           unzip -q /tmp/cmdline-tools.zip -d /tmp
-          mkdir -p /home/runner/Android/Sdk/cmdline-tools/latest
-          mv /tmp/cmdline-tools/* /home/runner/Android/Sdk/cmdline-tools/latest/
-          yes | /home/runner/Android/Sdk/cmdline-tools/latest/bin/sdkmanager --sdk_root=/home/runner/Android/Sdk "platform-tools" "platforms;android-34" "build-tools;34.0.0"
+          mkdir -p $ANDROID_SDK_ROOT/cmdline-tools/latest
+          mv /tmp/cmdline-tools/* $ANDROID_SDK_ROOT/cmdline-tools/latest/
+          yes | $ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager --sdk_root=$ANDROID_SDK_ROOT "platform-tools" "platforms;android-34" "build-tools;34.0.0"
+
       - name: Add SDK to PATH
         run: |
           echo "/home/runner/Android/Sdk/platform-tools" >> $GITHUB_PATH
           echo "/home/runner/Android/Sdk/cmdline-tools/latest/bin" >> $GITHUB_PATH
-      - name: Make gradlew executable
-        run: chmod +x ./gradlew
+
+      - name: Decide Gradle command (use wrapper if valid)
+        id: gradle-detect
+        run: |
+          # prefer using the project's wrapper if it has a valid jar; otherwise fall back to runner Gradle
+          if [ -f "gradle/wrapper/gradle-wrapper.jar" ]; then
+            # check that the jar actually contains the wrapper main class
+            if jar tf gradle/wrapper/gradle-wrapper.jar 2>/dev/null | grep -q "org/gradle/wrapper/GradleWrapperMain.class"; then
+              echo "Using project wrapper: ./gradlew"
+              echo "GRADLE_CMD=./gradlew" >> $GITHUB_ENV
+            else
+              echo "gradle-wrapper.jar present but invalid; will use system gradle"
+              echo "GRADLE_CMD=gradle" >> $GITHUB_ENV
+            fi
+          else
+            echo "No gradle-wrapper.jar found; will use system gradle"
+            echo "GRADLE_CMD=gradle" >> $GITHUB_ENV
+          fi
+
+      - name: Make gradlew executable if present
+        run: |
+          if [ -f ./gradlew ]; then chmod +x ./gradlew; ls -l ./gradlew; else echo "gradlew not present, skipping chmod"; fi
+
+      - name: Show gradle command
+        run: echo "Running build with -> $GRADLE_CMD"
+
       - name: Build debug APK
-        run: ./gradlew assembleDebug --no-daemon
+        run: $GRADLE_CMD assembleDebug --no-daemon
+        env:
+          JAVA_TOOL_OPTIONS: "-Dfile.encoding=UTF8"
+
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
