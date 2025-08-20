@@ -2,8 +2,18 @@
 <RelativeLayout xmlns:android="http://schemas.android.com/apk/res/android"
     android:id="@+id/fakeHomeRoot"
     android:layout_width="match_parent"
-    android:layout_height="match_parent"
-    android:background="@drawable/background">
+    android:layout_height="match_parent">
+
+    <!-- Full-screen background image (restored with id so activity code can reference it) -->
+    <ImageView
+        android:id="@+id/backgroundImage"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:scaleType="centerCrop"
+        android:contentDescription="@null"
+        android:src="@drawable/background"
+        android:clickable="false"
+        android:focusable="false" />
 
     <!-- Status bar / clock area -->
     <LinearLayout
