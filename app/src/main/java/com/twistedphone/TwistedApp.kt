@@ -37,16 +37,14 @@ class TwistedApp : Application() {
             )
         } catch (t: Throwable) {
             // If encrypted prefs creation fails, use normal SharedPreferences as a safe fallback.
-            // Do NOT cast the result to EncryptedSharedPreferences (invalid cast).
             securePrefs = getSharedPreferences("secure_prefs", Context.MODE_PRIVATE)
         }
 
-        // Schedule ALT message system initial work (if any)
+        // Schedule ALT message system initial work (no-arg call — your scheduler expects zero arguments)
         try {
-            AltMessageScheduler.scheduleInitial(this)
+            AltMessageScheduler.scheduleInitial()
         } catch (t: Throwable) {
             // Swallow scheduler errors to avoid crashing startup
-            // We want the app to remain usable even if scheduling fails on certain OEM devices.
             t.printStackTrace()
         }
     }
