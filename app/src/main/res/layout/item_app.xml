@@ -10,8 +10,8 @@
         android:id="@+id/appIcon"
         android:layout_width="48dp"
         android:layout_height="48dp"
-        android:scaleType="centerInside"
-        android:src="@drawable/ic_launcher" />
+        android:scaleType="centerInside" />
+        <!-- Removed the hardcoded android:src attribute -->
 
     <TextView
         android:id="@+id/appName"
