@@ -28,9 +28,8 @@ class FakeHomeActivity : AppCompatActivity() {
     private lateinit var clock: TextView
     private lateinit var grid: GridView
     private lateinit var backgroundImage: ImageView
-    private lateinit var dock: View
-    private lateinit var statusBar: View
-    private lateinit var rootLayout: FrameLayout
+    private lateinit var dock: LinearLayout
+    private lateinit var statusBar: LinearLayout
     private val handler = Handler(Looper.getMainLooper())
     private val rnd = Random()
     private val prefs = TwistedApp.instance.settingsPrefs
@@ -38,7 +37,7 @@ class FakeHomeActivity : AppCompatActivity() {
     private var jitteredTime: String = ""
     private var jitterIndex: Int = -1
 
-    // Jitter tick (slower to reduce layout churn)
+    // Jitter tick
     private val tick = object : Runnable {
         override fun run() {
             val now = Calendar.getInstance()
@@ -64,15 +63,14 @@ class FakeHomeActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_fake_home)
 
-        // --- views ---
+        // Initialize views
         clock = findViewById(R.id.jitterClock)
         grid = findViewById(R.id.appGrid)
         backgroundImage = findViewById(R.id.backgroundImage)
         dock = findViewById(R.id.dock)
         statusBar = findViewById(R.id.statusBar)
-        rootLayout = findViewById(R.id.rootLayout)
 
-        // Ensure background image is set safely (vectors supported)
+        // Set background image
         try {
             val bgDrawable = AppCompatResources.getDrawable(this, R.drawable.background)
             backgroundImage.setImageDrawable(bgDrawable)
@@ -81,7 +79,7 @@ class FakeHomeActivity : AppCompatActivity() {
             FileLogger.e(this, "FakeHomeActivity", "Failed to set background: ${e.message}")
         }
 
-        // --- apps list ---
+        // App list
         val apps = listOf(
             AppInfo("Browser", Intent(this, WebViewActivity::class.java), R.drawable.ic_browser),
             AppInfo("Camera", Intent(this, CameraActivity::class.java), R.drawable.ic_camera),
@@ -91,17 +89,15 @@ class FakeHomeActivity : AppCompatActivity() {
             AppInfo("Settings", Intent(this, SettingsActivity::class.java), R.drawable.ic_settings)
         )
 
-        // --- GridView adapter ---
+        // Set up GridView adapter
         val adapter = AppAdapter(this, apps)
         grid.adapter = adapter
-        grid.visibility = View.VISIBLE
         
         // Logging
         FileLogger.d(this, "FakeHomeActivity", "Number of apps: ${apps.size}")
         FileLogger.d(this, "FakeHomeActivity", "Grid adapter set: ${grid.adapter != null}")
-        FileLogger.d(this, "FakeHomeActivity", "Grid adapter count: ${grid.adapter?.count}")
 
-        // --- GridView click handling ---
+        // GridView click handling
         grid.setOnItemClickListener { _, _, pos, _ ->
             val appName = apps[pos].name
             if (isAppUnlocked(appName)) {
@@ -113,11 +109,12 @@ class FakeHomeActivity : AppCompatActivity() {
             }
         }
 
-        // --- Dock buttons (with long-press to show logs) ---
+        // Dock buttons
         findViewById<ImageButton>(R.id.btnBack).setOnClickListener {
             FileLogger.d(this, "FakeHomeActivity", "Back button clicked")
             finish()
         }
+        
         val homeBtn = findViewById<ImageButton>(R.id.btnHome)
         homeBtn.setOnClickListener {
             FileLogger.d(this, "FakeHomeActivity", "Home button clicked")
@@ -126,11 +123,12 @@ class FakeHomeActivity : AppCompatActivity() {
             showLogDialog()
             true
         }
+        
         findViewById<ImageButton>(R.id.btnRecent).setOnClickListener {
             FileLogger.d(this, "FakeHomeActivity", "Recent button clicked")
         }
 
-        // Force layout refresh to ensure GridView renders
+        // Force layout refresh
         handler.postDelayed({
             grid.invalidate()
             grid.requestLayout()
