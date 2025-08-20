@@ -78,8 +78,36 @@ class FakeHomeActivity : AppCompatActivity() {
             android.util.Log.e("FakeHomeActivity", "Failed to load background: ${e.message}")
         }
         
-        clock = findViewById(R.id.jitterClock)
-        val grid = findViewById<GridView>(R.id.appGrid)
+        // Replace the clock-related code in FakeHomeActivity.kt with this:
+        private lateinit var clock: TextView
+        private val handler = Handler(Looper.getMainLooper())
+        private val rnd = Random()
+        private var originalTime: String = ""
+        private var jitteredTime: String = ""
+        private var jitterIndex: Int = -1
+        private val tick = object : Runnable {
+            override fun run() {
+                val now = Calendar.getInstance()
+                val currentTime = String.format("%02d:%02d", now.get(Calendar.HOUR_OF_DAY), now.get(Calendar.MINUTE))
+                // Every 2 seconds, change a random digit
+                if (System.currentTimeMillis() % 2000 < 100) {
+                    // Save original time
+                    originalTime = currentTime
+                    // Choose a random digit to jitter (positions 0,1,3,4 are digits in HH:MM format)
+                    val digitPositions = intArrayOf(0, 1, 3, 4)
+                    jitterIndex = digitPositions[rnd.nextInt(digitPositions.size)]
+                    // Create jittered time with one random digit changed
+                    val chars = currentTime.toCharArray()
+                    chars[jitterIndex] = (rnd.nextInt(10) + '0'.code).toChar()
+                    jitteredTime = String(chars)
+                    clock.text = jitteredTime
+                } else {
+                    // Show normal time
+                    clock.text = originalTime
+                }
+                handler.postDelayed(this, 100) // Update every 100ms for smooth animation
+            }
+        }
         
         // Create app list with icons
         val apps = listOf(
