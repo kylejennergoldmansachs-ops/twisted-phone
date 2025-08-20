@@ -1,11 +1,11 @@
 <?xml version="1.0" encoding="utf-8"?>
-<RelativeLayout xmlns:android="http://schemas.android.com/apk/res/android"
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
     android:id="@+id/rootLayout"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
     android:background="#000000">
 
-    <!-- Background image (first child = bottom layer) -->
+    <!-- Background image (bottom layer) -->
     <ImageView
         android:id="@+id/backgroundImage"
         android:layout_width="match_parent"
@@ -14,85 +14,86 @@
         android:contentDescription="@null"
         android:src="@drawable/background" />
 
-    <!-- Status bar (explicitly aligned to top) -->
+    <!-- Main content layout -->
     <LinearLayout
-        android:id="@+id/statusBar"
-        android:layout_alignParentTop="true"
-        android:orientation="horizontal"
         android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:padding="12dp">
+        android:layout_height="match_parent"
+        android:orientation="vertical">
 
-        <TextView
-            android:id="@+id/jitterClock"
-            android:text="00:00"
-            android:textColor="#FFFFFF"
-            android:textSize="18sp"
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content" />
-
-        <View
-            android:layout_width="0dp"
+        <!-- Status bar -->
+        <LinearLayout
+            android:id="@+id/statusBar"
+            android:orientation="horizontal"
+            android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:layout_weight="1" />
+            android:padding="12dp">
 
-        <ImageView
-            android:layout_width="24dp"
-            android:layout_height="24dp"
-            android:src="@drawable/distorted_battery"
-            android:contentDescription="@null" />
+            <TextView
+                android:id="@+id/jitterClock"
+                android:text="00:00"
+                android:textColor="#FFFFFF"
+                android:textSize="18sp"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content" />
+
+            <View
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1" />
+
+            <ImageView
+                android:layout_width="24dp"
+                android:layout_height="24dp"
+                android:src="@drawable/distorted_battery"
+                android:contentDescription="@null" />
+        </LinearLayout>
+
+        <!-- App grid - takes remaining space -->
+        <GridView
+            android:id="@+id/appGrid"
+            android:layout_width="match_parent"
+            android:layout_height="0dp"
+            android:layout_weight="1"
+            android:numColumns="3"
+            android:verticalSpacing="16dp"
+            android:horizontalSpacing="8dp"
+            android:stretchMode="columnWidth"
+            android:gravity="center"
+            android:paddingTop="12dp"
+            android:paddingBottom="12dp" />
+
+        <!-- Dock (bottom) -->
+        <LinearLayout
+            android:id="@+id/dock"
+            android:orientation="horizontal"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:gravity="center"
+            android:padding="8dp">
+
+            <ImageButton
+                android:id="@+id/btnBack"
+                android:src="@drawable/distorted_back"
+                android:layout_width="48dp"
+                android:layout_height="48dp"
+                android:background="@null" />
+
+            <ImageButton
+                android:id="@+id/btnHome"
+                android:src="@drawable/distorted_home"
+                android:layout_width="48dp"
+                android:layout_height="48dp"
+                android:layout_marginStart="16dp"
+                android:background="@null" />
+
+            <ImageButton
+                android:id="@+id/btnRecent"
+                android:src="@drawable/distorted_recent"
+                android:layout_width="48dp"
+                android:layout_height="48dp"
+                android:layout_marginStart="16dp"
+                android:background="@null" />
+        </LinearLayout>
     </LinearLayout>
 
-    <!-- App grid - explicitly between statusBar and dock -->
-    <GridView
-        android:id="@+id/appGrid"
-        android:layout_below="@id/statusBar"
-        android:layout_above="@id/dock"
-        android:layout_alignParentStart="true"
-        android:layout_alignParentEnd="true"
-        android:layout_width="match_parent"
-        android:layout_height="0dp"
-        android:layout_weight="1"
-        android:numColumns="3"
-        android:verticalSpacing="16dp"
-        android:horizontalSpacing="8dp"
-        android:stretchMode="columnWidth"
-        android:gravity="center"
-        android:paddingTop="12dp"
-        android:paddingBottom="12dp" />
-
-    <!-- Dock (bottom) -->
-    <LinearLayout
-        android:id="@+id/dock"
-        android:orientation="horizontal"
-        android:layout_alignParentBottom="true"
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:gravity="center"
-        android:padding="8dp">
-
-        <ImageButton
-            android:id="@+id/btnBack"
-            android:src="@drawable/distorted_back"
-            android:layout_width="48dp"
-            android:layout_height="48dp"
-            android:background="@null" />
-
-        <ImageButton
-            android:id="@+id/btnHome"
-            android:src="@drawable/distorted_home"
-            android:layout_width="48dp"
-            android:layout_height="48dp"
-            android:layout_marginStart="16dp"
-            android:background="@null" />
-
-        <ImageButton
-            android:id="@+id/btnRecent"
-            android:src="@drawable/distorted_recent"
-            android:layout_width="48dp"
-            android:layout_height="48dp"
-            android:layout_marginStart="16dp"
-            android:background="@null" />
-    </LinearLayout>
-
-</RelativeLayout>
+</FrameLayout>
