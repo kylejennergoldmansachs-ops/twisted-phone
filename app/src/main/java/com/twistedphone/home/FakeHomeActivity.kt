@@ -60,7 +60,9 @@ class FakeHomeActivity : AppCompatActivity() {
         setContentView(R.layout.activity_fake_home)
         
         // Set background if available
+        // Replace the background setting code in onCreate() with this:
         try {
+            // First try to use the custom background
             val background = BitmapFactory.decodeResource(resources, R.drawable.background)
             val scaledBackground = Bitmap.createScaledBitmap(
                 background, 
@@ -68,10 +70,12 @@ class FakeHomeActivity : AppCompatActivity() {
                 resources.displayMetrics.heightPixels,
                 true
             )
-            findViewById<View>(android.R.id.content).rootView.background = BitmapDrawable(resources, scaledBackground)
+            val rootView = findViewById<View>(android.R.id.content).rootView
+            rootView.background = BitmapDrawable(resources, scaledBackground)
         } catch (e: Exception) {
             // Use default background if custom background isn't available
             findViewById<View>(android.R.id.content).rootView.setBackgroundColor(0xFF1A1A1A.toInt())
+            android.util.Log.e("FakeHomeActivity", "Failed to load background: ${e.message}")
         }
         
         clock = findViewById(R.id.jitterClock)
