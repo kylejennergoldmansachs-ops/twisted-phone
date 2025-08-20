@@ -3,34 +3,29 @@ package com.twistedphone.camera
 import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
-import android.graphics.SurfaceTexture
 import android.opengl.GLES11Ext
 import android.opengl.GLES20
 import android.opengl.GLSurfaceView
-import android.opengl.Matrix
 import android.os.Bundle
 import android.util.Size
 import android.widget.Button
+import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
-import androidx.camera.core.CameraSelector
-import androidx.camera.core.ImageAnalysis
-import androidx.camera.core.ImageProxy
-import androidx.camera.core.Preview
+import androidx.camera.core.*
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
 import androidx.core.content.ContextCompat
 import com.twistedphone.R
 import com.twistedphone.TwistedApp
+import com.twistedphone.util.FileLogger
 import org.tensorflow.lite.Interpreter
-import org.tensorflow.lite.gpu.CompatibilityList
 import org.tensorflow.lite.gpu.GpuDelegate
 import org.tensorflow.lite.support.common.FileUtil
 import org.tensorflow.lite.support.image.TensorImage
 import org.tensorflow.lite.support.tensorbuffer.TensorBuffer
-import org.tensorflow.lite.task.vision.detector.Detection
 import org.tensorflow.lite.task.vision.detector.ObjectDetector
 import java.io.File
-import java.nio.ByteBuffer
+import java.nio.FloatBuffer
 import javax.microedition.khronos.egl.EGLConfig
 import javax.microedition.khronos.opengles.GL10
 import kotlin.math.cos
@@ -45,17 +40,13 @@ class CameraActivity : AppCompatActivity() {
     private var poseDetector: ObjectDetector? = null
     private var useEnhanced = false
     private var aggressiveness = 1
-    private var depthMap: TensorBuffer? = null // low-res depth
-    private var poseLandmarks: List<Detection>? = null // detections
+    private var depthMap: TensorBuffer? = null
 
     override fun onCreate(s: Bundle?) {
         super.onCreate(s)
         setContentView(R.layout.activity_camera)
         previewView = findViewById(R.id.previewView)
         glSurfaceView = findViewById(R.id.glSurfaceView)
-        glSurfaceView.setEGLContextClientVersion(2)
-        glSurfaceView.setRenderer(WarpRenderer(this))
-        glSurfaceView.renderMode = GLSurfaceView.RENDERMODE_CONTINUOUSLY
         useEnhanced = prefs.getBoolean("enhanced_camera", false)
         aggressiveness = prefs.getInt("aggressiveness", 1)
         findViewById<Button>(R.id.btnToggle).setOnClickListener {
@@ -63,80 +54,127 @@ class CameraActivity : AppCompatActivity() {
             startCamera()
         }
         findViewById<Button>(R.id.btnCapture).setOnClickListener { captureImage() }
-        loadModels()
+
+        // Set up GL renderer safely (textures created on GL thread)
+        glSurfaceView.setEGLContextClientVersion(2)
+        glSurfaceView.setRenderer(WarpRenderer(this))
+        glSurfaceView.renderMode = GLSurfaceView.RENDERMODE_CONTINUOUSLY
+
+        loadModelsSafe()
         startCamera()
     }
 
-    private fun loadModels() {
+    private fun loadModelsSafe() {
         if (!useEnhanced) return
         try {
             val midasFile = File(filesDir, "models/midas.tflite")
             if (midasFile.exists()) {
                 val options = Interpreter.Options()
-                if (CompatibilityList().isDelegateSupportedOnThisDevice) {
+                try {
                     options.addDelegate(GpuDelegate())
-                }
+                } catch (_: Throwable) { /* if GPU delegate fails, continue without it */ }
                 midasInterpreter = Interpreter(FileUtil.loadMappedFile(this, midasFile.path), options)
+                FileLogger.d(this, "CameraActivity", "Loaded midas interpreter")
             }
             val poseFile = File(filesDir, "models/pose.tflite")
             if (poseFile.exists()) {
-                val poseOptions = ObjectDetector.ObjectDetectorOptions.builder().setBaseOptions(org.tensorflow.lite.task.core.BaseOptions.builder().useGpu().build()).setMaxResults(1).build()
+                val poseOptions = ObjectDetector.ObjectDetectorOptions.builder().setBaseOptions(
+                    org.tensorflow.lite.task.core.BaseOptions.builder().useGpu().build()
+                ).setMaxResults(1).build()
                 poseDetector = ObjectDetector.createFromFileAndOptions(this, poseFile.path, poseOptions)
+                FileLogger.d(this, "CameraActivity", "Loaded pose detector")
             }
-        } catch (e: Exception) { useEnhanced = false }
+        } catch (e: Exception) {
+            FileLogger.e(this, "CameraActivity", "Model load failed; disabling enhanced mode: ${e.message}")
+            useEnhanced = false
+        }
     }
 
     private fun startCamera() {
-        val providerF = ProcessCameraProvider.getInstance(this)
-        providerF.addListener({
-            val provider = providerF.get()
-            val preview = Preview.Builder().build().also { it.setSurfaceProvider(previewView.surfaceProvider) }
-            val analysis = ImageAnalysis.Builder().setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST).setTargetResolution(Size(640, 480)).build()
-            analysis.setAnalyzer(ContextCompat.getMainExecutor(this)) { img -> processImage(img) }
-            provider.unbindAll()
-            provider.bindToLifecycle(this, cameraSelector, preview, analysis)
-        }, ContextCompat.getMainExecutor(this))
+        try {
+            val providerF = ProcessCameraProvider.getInstance(this)
+            providerF.addListener({
+                try {
+                    val provider = providerF.get()
+                    val preview = Preview.Builder().build().also { it.setSurfaceProvider(previewView.surfaceProvider) }
+                    val analysis = ImageAnalysis.Builder()
+                        .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+                        .setTargetResolution(Size(640, 480))
+                        .build()
+                    analysis.setAnalyzer(ContextCompat.getMainExecutor(this)) { img -> processImage(img) }
+                    provider.unbindAll()
+                    provider.bindToLifecycle(this, cameraSelector, preview, analysis)
+                } catch (e: Exception) {
+                    FileLogger.e(this, "CameraActivity", "Camera bind failed: ${e.message}")
+                    Toast.makeText(this, "Camera not available", Toast.LENGTH_SHORT).show()
+                }
+            }, ContextCompat.getMainExecutor(this))
+        } catch (e: Exception) {
+            FileLogger.e(this, "CameraActivity", "startCamera exception: ${e.message}")
+            Toast.makeText(this, "Camera initialization failed", Toast.LENGTH_SHORT).show()
+        }
     }
 
     private fun processImage(image: ImageProxy) {
-        if (useEnhanced) {
-            val bitmap = imageProxyToBitmap(image) ?: return
-            // MiDaS depth
-            midasInterpreter?.let { interpreter ->
-                val scaledBitmap = Bitmap.createScaledBitmap(bitmap, 256, 256, true)
-                val input = TensorImage.fromBitmap(scaledBitmap)
-                val outputs = Array(1) { FloatArray(256 * 256) }
-                interpreter.run(arrayOf(input.buffer), outputs)
-                depthMap = TensorBuffer.createFixedSize(intArrayOf(1, 256, 256, 1), org.tensorflow.lite.DataType.FLOAT32)
-                depthMap?.loadArray(outputs[0])
+        try {
+            if (useEnhanced) {
+                val bmp = try { imageProxyToBitmap(image) } catch (e: Exception) { null }
+                bmp?.let { bitmap ->
+                    try {
+                        val scaled = Bitmap.createScaledBitmap(bitmap, 256, 256, true)
+                        val input = TensorImage.fromBitmap(scaled)
+                        val outputs = Array(1) { FloatArray(256 * 256) }
+                        midasInterpreter?.run(arrayOf(input.buffer), outputs)
+                        depthMap = TensorBuffer.createFixedSize(intArrayOf(1, 256, 256, 1), org.tensorflow.lite.DataType.FLOAT32)
+                        depthMap?.loadArray(outputs[0])
+                    } catch (e: Exception) {
+                        FileLogger.e(this, "CameraActivity", "Depth infer failed: ${e.message}")
+                    }
+                    try {
+                        val detections = poseDetector?.detect(TensorImage.fromBitmap(bitmap))
+                    } catch (e: Exception) {
+                        FileLogger.e(this, "CameraActivity", "Pose detect failed: ${e.message}")
+                    }
+                }
             }
-            // Pose detection
-            poseDetector?.let { detector ->
-                poseLandmarks = detector.detect(TensorImage.fromBitmap(bitmap))
-            }
+        } catch (e: Exception) {
+            FileLogger.e(this, "CameraActivity", "processImage error: ${e.message}")
+        } finally {
+            image.close()
         }
-        image.close()
     }
 
     private fun imageProxyToBitmap(image: ImageProxy): Bitmap? {
-        val planeProxy = image.planes[0]
-        val buffer = planeProxy.buffer
-        buffer.rewind()
-        val bytes = ByteArray(buffer.remaining())
-        buffer.get(bytes)
-        return BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+        try {
+            // Best-effort conversion. If the ImageProxy contains a JPEG byte buffer we decode it.
+            val plane = image.planes[0]
+            plane.buffer.rewind()
+            val bytes = ByteArray(plane.buffer.remaining())
+            plane.buffer.get(bytes)
+            // try decode - if image is NV21 this will fail; we catch and return null
+            return BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+        } catch (e: Exception) {
+            FileLogger.e(this, "CameraActivity", "imageProxyToBitmap failed: ${e.message}")
+            return null
+        }
     }
 
     private fun captureImage() {
-        // Capture from preview, apply warp (using current depth/pose), save to MediaStore
-        previewView.bitmap?.let { bmp ->
-            val warped = simpleWarp(bmp) // placeholder warp, or use shader snapshot if possible
-            android.provider.MediaStore.Images.Media.insertImage(contentResolver, warped, "TwistedCapture", "Captured in Twisted Phone")
+        try {
+            val bmp = previewView.bitmap
+            if (bmp != null) {
+                val warped = simpleWarp(bmp)
+                android.provider.MediaStore.Images.Media.insertImage(contentResolver, warped, "TwistedCapture", "Captured in Twisted Phone")
+                Toast.makeText(this, "Captured", Toast.LENGTH_SHORT).show()
+            } else {
+                Toast.makeText(this, "Capture failed", Toast.LENGTH_SHORT).show()
+            }
+        } catch (e: Exception) {
+            FileLogger.e(this, "CameraActivity", "captureImage failed: ${e.message}")
         }
     }
 
     private fun simpleWarp(bmp: Bitmap): Bitmap {
-        // Simple CPU warp fallback if needed
         val w = bmp.width; val h = bmp.height
         val out = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
         val time = System.currentTimeMillis() / 300.0
@@ -156,66 +194,70 @@ class CameraActivity : AppCompatActivity() {
     inner class WarpRenderer(private val ctx: Context) : GLSurfaceView.Renderer {
         private var program = 0
         private var textureId = 0
+        private var surfaceTexture: android.graphics.SurfaceTexture? = null
         private val mvpMatrix = FloatArray(16)
         private val projMatrix = FloatArray(16)
         private val viewMatrix = FloatArray(16)
-        private var surfaceTexture: SurfaceTexture? = null
-        private val oesTexture = IntArray(1)
-
-        init {
-            GLES20.glGenTextures(1, oesTexture, 0)
-            textureId = oesTexture[0]
-            GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, textureId)
-            GLES20.glTexParameterf(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR.toFloat())
-            GLES20.glTexParameterf(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR.toFloat())
-            GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_WRAP_S, GLES20.GL_CLAMP_TO_EDGE)
-            GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_CLAMP_TO_EDGE)
-            surfaceTexture = SurfaceTexture(textureId)
-        }
+        private var oesTexture = IntArray(1)
 
         override fun onSurfaceCreated(gl: GL10?, config: EGLConfig?) {
-            GLES20.glClearColor(0f, 0f, 0f, 1f)
-            program = createProgram() // create shader program
+            try {
+                GLES20.glClearColor(0f, 0f, 0f, 1f)
+                // create OES texture now that GL context exists
+                GLES20.glGenTextures(1, oesTexture, 0)
+                textureId = oesTexture[0]
+                GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, textureId)
+                GLES20.glTexParameterf(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR.toFloat())
+                GLES20.glTexParameterf(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR.toFloat())
+                GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_WRAP_S, GLES20.GL_CLAMP_TO_EDGE)
+                GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_CLAMP_TO_EDGE)
+                surfaceTexture = android.graphics.SurfaceTexture(textureId)
+                program = createProgram()
+            } catch (e: Exception) {
+                FileLogger.e(ctx, "WarpRenderer", "onSurfaceCreated err: ${e.message}")
+            }
         }
 
         override fun onSurfaceChanged(gl: GL10?, width: Int, height: Int) {
             GLES20.glViewport(0, 0, width, height)
             val ratio = width.toFloat() / height
-            Matrix.frustumM(projMatrix, 0, -ratio, ratio, -1f, 1f, 3f, 7f)
+            android.opengl.Matrix.frustumM(projMatrix, 0, -ratio, ratio, -1f, 1f, 3f, 7f)
         }
 
         override fun onDrawFrame(gl: GL10?) {
-            surfaceTexture?.updateTexImage()
-            GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT or GLES20.GL_DEPTH_BUFFER_BIT)
-            Matrix.setLookAtM(viewMatrix, 0, 0f, 0f, 3f, 0f, 0f, 0f, 0f, 1f, 0f)
-            Matrix.multiplyMM(mvpMatrix, 0, projMatrix, 0, viewMatrix, 0)
-            GLES20.glUseProgram(program)
-            val timeLoc = GLES20.glGetUniformLocation(program, "time")
-            GLES20.glUniform1f(timeLoc, (System.currentTimeMillis() % 1000000) / 1000f)
-            val aggLoc = GLES20.glGetUniformLocation(program, "agg")
-            GLES20.glUniform1f(aggLoc, aggressiveness.toFloat())
-            // Bind OES texture
-            GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
-            GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, textureId)
-            val texLoc = GLES20.glGetUniformLocation(program, "uTexture")
-            GLES20.glUniform1i(texLoc, 0)
-            // Draw quad (vertices for full screen quad)
-            val vBuffer = java.nio.FloatBuffer.wrap(floatArrayOf(-1f, -1f, 1f, -1f, -1f, 1f, 1f, 1f))
-            val posLoc = GLES20.glGetAttribLocation(program, "vPosition")
-            GLES20.glEnableVertexAttribArray(posLoc)
-            GLES20.glVertexAttribPointer(posLoc, 2, GLES20.GL_FLOAT, false, 0, vBuffer)
-            GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
-            GLES20.glDisableVertexAttribArray(posLoc)
+            try {
+                surfaceTexture?.updateTexImage()
+                GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT or GLES20.GL_DEPTH_BUFFER_BIT)
+                android.opengl.Matrix.setLookAtM(viewMatrix, 0, 0f, 0f, 3f, 0f, 0f, 0f, 0f, 1f, 0f)
+                android.opengl.Matrix.multiplyMM(mvpMatrix, 0, projMatrix, 0, viewMatrix, 0)
+                GLES20.glUseProgram(program)
+                val timeLoc = GLES20.glGetUniformLocation(program, "time")
+                GLES20.glUniform1f(timeLoc, (System.currentTimeMillis() % 1000000) / 1000f)
+                val aggLoc = GLES20.glGetUniformLocation(program, "agg")
+                GLES20.glUniform1f(aggLoc, aggressiveness.toFloat())
+                GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
+                GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, textureId)
+                val texLoc = GLES20.glGetUniformLocation(program, "uTexture")
+                GLES20.glUniform1i(texLoc, 0)
+                val vBuffer: FloatBuffer = FloatBuffer.wrap(floatArrayOf(-1f, -1f, 1f, -1f, -1f, 1f, 1f, 1f))
+                val posLoc = GLES20.glGetAttribLocation(program, "vPosition")
+                GLES20.glEnableVertexAttribArray(posLoc)
+                GLES20.glVertexAttribPointer(posLoc, 2, GLES20.GL_FLOAT, false, 0, vBuffer)
+                GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
+                GLES20.glDisableVertexAttribArray(posLoc)
+            } catch (e: Exception) {
+                FileLogger.e(ctx, "WarpRenderer", "onDrawFrame error: ${e.message}")
+            }
         }
 
         private fun createProgram(): Int {
-            val vertexShader = loadShader(GLES20.GL_VERTEX_SHADER, vertexCode)
-            val fragmentShader = loadShader(GLES20.GL_FRAGMENT_SHADER, fragmentCode)
-            val prog = GLES20.glCreateProgram()
-            GLES20.glAttachShader(prog, vertexShader)
-            GLES20.glAttachShader(prog, fragmentShader)
-            GLES20.glLinkProgram(prog)
-            return prog
+            val vert = loadShader(GLES20.GL_VERTEX_SHADER, vertexCode)
+            val frag = loadShader(GLES20.GL_FRAGMENT_SHADER, fragmentCode)
+            val p = GLES20.glCreateProgram()
+            GLES20.glAttachShader(p, vert)
+            GLES20.glAttachShader(p, frag)
+            GLES20.glLinkProgram(p)
+            return p
         }
 
         private fun loadShader(type: Int, code: String): Int {
@@ -246,7 +288,7 @@ class CameraActivity : AppCompatActivity() {
                 uv.x += sin(uv.y * 10.0 + time) * 0.05 * agg;
                 uv.y += cos(uv.x * 8.0 + time) * 0.03 * agg;
                 gl_FragColor = texture2D(uTexture, uv);
-                gl_FragColor.rgb *= 0.8; // darken
+                gl_FragColor.rgb *= 0.8;
             }
         """.trimIndent()
     }
