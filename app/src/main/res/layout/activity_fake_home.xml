@@ -2,7 +2,8 @@
 <RelativeLayout xmlns:android="http://schemas.android.com/apk/res/android"
     android:id="@+id/fakeHomeRoot"
     android:layout_width="match_parent"
-    android:layout_height="match_parent">
+    android:layout_height="match_parent"
+    android:background="@android:color/black">
 
     <!-- Full-screen background image -->
     <ImageView
@@ -15,26 +16,29 @@
         android:clickable="false"
         android:focusable="false" />
 
-    <!-- Status bar / clock area (top) -->
+    <!-- Top bar / clock -->
     <LinearLayout
         android:id="@+id/statusBar"
         android:layout_width="match_parent"
         android:layout_height="56dp"
+        android:layout_alignParentTop="true"
         android:orientation="horizontal"
         android:gravity="center_vertical"
         android:paddingStart="12dp"
-        android:paddingEnd="12dp">
-        <!-- Jittery clock (your existing view) -->
+        android:paddingEnd="12dp"
+        android:background="@android:color/transparent">
+
         <TextView
             android:id="@+id/clockText"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
             android:text="12:00"
+            android:textColor="@android:color/white"
             android:textSize="20sp"
-            android:textColor="@android:color/white" />
+            android:importantForAccessibility="no" />
     </LinearLayout>
 
-    <!-- Grid of apps. TEMP: translucent red background to visualize bounds -->
+    <!-- App grid -->
     <GridView
         android:id="@+id/appGrid"
         android:layout_width="match_parent"
@@ -42,17 +46,18 @@
         android:layout_below="@id/statusBar"
         android:layout_above="@id/dock"
         android:numColumns="3"
-        android:verticalSpacing="16dp"
-        android:horizontalSpacing="8dp"
+        android:verticalSpacing="12dp"
+        android:horizontalSpacing="12dp"
+        android:columnWidth="96dp"
         android:stretchMode="columnWidth"
         android:gravity="center"
         android:paddingTop="12dp"
         android:paddingBottom="12dp"
         android:clipToPadding="false"
-        android:elevation="20dp"
-        android:background="#33FF0000" />
+        android:scrollbars="vertical"
+        android:focusable="true" />
 
-    <!-- Dock (bottom icons: home, back, recent) -->
+    <!-- Bottom dock (home/back/recent) -->
     <LinearLayout
         android:id="@+id/dock"
         android:layout_width="match_parent"
@@ -61,15 +66,14 @@
         android:orientation="horizontal"
         android:gravity="center"
         android:padding="8dp"
-        android:background="@android:color/transparent"
-        android:elevation="10dp">
+        android:background="@android:color/transparent">
 
         <ImageButton
             android:id="@+id/btnBack"
             android:layout_width="56dp"
             android:layout_height="56dp"
             android:src="@drawable/ic_back"
-            android:background="?selectableItemBackgroundBorderless"
+            android:background="?android:attr/selectableItemBackgroundBorderless"
             android:contentDescription="Back" />
 
         <ImageButton
@@ -77,7 +81,7 @@
             android:layout_width="64dp"
             android:layout_height="64dp"
             android:src="@drawable/ic_home"
-            android:background="?selectableItemBackgroundBorderless"
+            android:background="?android:attr/selectableItemBackgroundBorderless"
             android:contentDescription="Home" />
 
         <ImageButton
@@ -85,7 +89,7 @@
             android:layout_width="56dp"
             android:layout_height="56dp"
             android:src="@drawable/ic_recent"
-            android:background="?selectableItemBackgroundBorderless"
+            android:background="?android:attr/selectableItemBackgroundBorderless"
             android:contentDescription="Recent" />
     </LinearLayout>
 </RelativeLayout>
