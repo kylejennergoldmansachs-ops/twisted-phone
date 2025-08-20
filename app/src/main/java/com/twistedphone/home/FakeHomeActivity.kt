@@ -28,6 +28,8 @@ import java.util.Calendar
 import java.util.Random
 import android.os.Handler
 import android.os.Looper
+import androidx.appcompat.app.AlertDialog
+import android.widget.ScrollView
 
 class FakeHomeActivity : AppCompatActivity() {
     private lateinit var clock: TextView
@@ -47,7 +49,6 @@ class FakeHomeActivity : AppCompatActivity() {
             val now = Calendar.getInstance()
             val currentTime = String.format("%02d:%02d", now.get(Calendar.HOUR_OF_DAY), now.get(Calendar.MINUTE))
 
-            // Every 2 seconds, change a random digit
             if (System.currentTimeMillis() % 2000 < 100) {
                 originalTime = currentTime
                 val digitPositions = intArrayOf(0, 1, 3, 4)
@@ -75,17 +76,16 @@ class FakeHomeActivity : AppCompatActivity() {
         dock = findViewById(R.id.dock)
         statusBar = findViewById(R.id.statusBar)
 
-        // Ensure background image is present (falls back to XML src if not)
+        // Ensure background image
         try {
-            // AppCompatResources handles vectors too if background is a vector drawable
             val bgDrawable = AppCompatResources.getDrawable(this, R.drawable.background)
             backgroundImage.setImageDrawable(bgDrawable)
-            Log.d("FakeHomeActivity", "Background image set from resources")
+            FileLogger.d(this, "FakeHomeActivity", "Background image set")
         } catch (e: Exception) {
-            Log.e("FakeHomeActivity", "Failed to set background image: ${e.message}")
+            FileLogger.e(this, "FakeHomeActivity", "Failed to set background: ${e.message}")
         }
 
-        // Create app list with icons
+        // App list
         val apps = listOf(
             AppInfo("Browser", Intent(this, WebViewActivity::class.java), R.drawable.ic_browser),
             AppInfo("Camera", Intent(this, CameraActivity::class.java), R.drawable.ic_camera),
@@ -95,7 +95,6 @@ class FakeHomeActivity : AppCompatActivity() {
             AppInfo("Settings", Intent(this, SettingsActivity::class.java), R.drawable.ic_settings)
         )
 
-        // Adapter + layout tweaks
         grid.numColumns = 3
         val adapter = AppAdapter(this, apps)
         grid.adapter = adapter
@@ -104,39 +103,45 @@ class FakeHomeActivity : AppCompatActivity() {
         grid.isClickable = true
         grid.isFocusable = true
 
-        // Bring important overlays to front & set elevation so background can't cover them
+        // Keep overlays visible above background
         grid.bringToFront()
-        grid.elevation = 20f
         dock.bringToFront()
         statusBar.bringToFront()
-        grid.invalidate()
+        grid.elevation = 20f
+        dock.elevation = 25f
+        statusBar.elevation = 30f
 
-        // Debug logging
-        Log.d("FakeHomeActivity", "Number of apps: ${apps.size}")
-        Log.d("FakeHomeActivity", "Grid adapter set: ${grid.adapter != null}")
-        Log.d("FakeHomeActivity", "Grid adapter count: ${(grid.adapter as? BaseAdapter)?.count}")
+        // Debug logs
+        FileLogger.d(this, "FakeHomeActivity", "Number of apps: ${apps.size}")
+        FileLogger.d(this, "FakeHomeActivity", "Grid adapter set: ${grid.adapter != null}")
+        FileLogger.d(this, "FakeHomeActivity", "Grid adapter count: ${(grid.adapter as? BaseAdapter)?.count}")
 
         grid.setOnItemClickListener { _, _, pos, _ ->
             val appName = apps[pos].name
             if (isAppUnlocked(appName)) {
                 startActivity(apps[pos].intent)
-                Log.d("FakeHomeActivity", "Launching app: $appName")
+                FileLogger.d(this, "FakeHomeActivity", "Launching app: $appName")
             } else {
                 Toast.makeText(this, "$appName is locked. Wait for unlock.", Toast.LENGTH_SHORT).show()
+                FileLogger.d(this, "FakeHomeActivity", "Blocked launch (locked): $appName")
             }
         }
 
         findViewById<ImageButton>(R.id.btnBack).setOnClickListener {
-            Log.d("FakeHomeActivity", "Back button clicked")
+            FileLogger.d(this, "FakeHomeActivity", "Back button clicked")
             finish()
         }
-        findViewById<ImageButton>(R.id.btnHome).setOnClickListener {
-            Log.d("FakeHomeActivity", "Home button clicked")
-            // Stay on home screen
+        val homeBtn = findViewById<ImageButton>(R.id.btnHome)
+        homeBtn.setOnClickListener {
+            FileLogger.d(this, "FakeHomeActivity", "Home button clicked")
+        }
+        // Long press home = show logs
+        homeBtn.setOnLongClickListener {
+            showLogDialog()
+            true
         }
         findViewById<ImageButton>(R.id.btnRecent).setOnClickListener {
-            Log.d("FakeHomeActivity", "Recent button clicked")
-            // Show recent apps (placeholder)
+            FileLogger.d(this, "FakeHomeActivity", "Recent button clicked")
         }
     }
 
@@ -147,13 +152,37 @@ class FakeHomeActivity : AppCompatActivity() {
     override fun onResume() {
         super.onResume()
         handler.post(tick)
-        Log.d("FakeHomeActivity", "Activity resumed")
+        FileLogger.d(this, "FakeHomeActivity", "Activity resumed")
     }
 
     override fun onPause() {
         super.onPause()
         handler.removeCallbacks(tick)
-        Log.d("FakeHomeActivity", "Activity paused")
+        FileLogger.d(this, "FakeHomeActivity", "Activity paused")
+    }
+
+    private fun showLogDialog() {
+        val logs = FileLogger.readAll(this)
+        val tv = TextView(this)
+        tv.text = logs
+        tv.setTextIsSelectable(true)
+        tv.setPadding(20, 20, 20, 20)
+
+        val scroll = ScrollView(this)
+        scroll.addView(tv)
+
+        AlertDialog.Builder(this)
+            .setTitle("TwistedPhone logs")
+            .setView(scroll)
+            .setPositiveButton("Share") { _, _ ->
+                val send = Intent(Intent.ACTION_SEND)
+                send.type = "text/plain"
+                send.putExtra(Intent.EXTRA_SUBJECT, "TwistedPhone logs")
+                send.putExtra(Intent.EXTRA_TEXT, logs)
+                startActivity(Intent.createChooser(send, "Share logs"))
+            }
+            .setNegativeButton("Close", null)
+            .show()
     }
 
     data class AppInfo(val name: String, val intent: Intent, val iconRes: Int)
@@ -172,7 +201,6 @@ class FakeHomeActivity : AppCompatActivity() {
             val appNameView = view.findViewById<TextView>(R.id.appName)
             val appIconView = view.findViewById<ImageView>(R.id.appIcon)
 
-            // Ensure children don't take focus so GridView receives click events
             appIconView.isFocusable = false
             appIconView.isFocusableInTouchMode = false
             appNameView.isFocusable = false
@@ -182,13 +210,11 @@ class FakeHomeActivity : AppCompatActivity() {
             try {
                 val drawable = AppCompatResources.getDrawable(parent.context, app.iconRes)
                 appIconView.setImageDrawable(drawable)
-                Log.d("AppAdapter", "getView pos=$position name=${app.name} iconRes=${app.iconRes} drawablePresent=${drawable != null}")
+                FileLogger.d(parent.context, "AppAdapter",
+                    "getView pos=$position name=${app.name} iconRes=${app.iconRes} drawable=${drawable != null}")
             } catch (e: Exception) {
-                Log.e("AppAdapter", "Failed to set icon for ${app.name}: ${e.message}")
+                FileLogger.e(parent.context, "AppAdapter", "Failed to set icon for ${app.name}: ${e.message}")
             }
-
-            // Optional: highlight the item area during debugging (remove later)
-            // view.setBackgroundColor(android.graphics.Color.argb(20, 255, 255, 255))
 
             return view
         }
