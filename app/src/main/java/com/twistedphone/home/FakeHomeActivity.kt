@@ -16,7 +16,6 @@ import com.twistedphone.TwistedApp
 import com.twistedphone.browser.WebViewActivity
 import com.twistedphone.camera.CameraActivity
 import com.twistedphone.gallery.GalleryActivity
-import com.twistedphone.messages.MessagesActivity
 import com.twistedphone.messages.WhosAppActivity
 import com.twistedphone.settings.SettingsActivity
 import java.util.Calendar
@@ -79,12 +78,12 @@ class FakeHomeActivity : AppCompatActivity() {
             FileLogger.e(this, "FakeHomeActivity", "Failed to set background: ${e.message}")
         }
 
-        // App list - preserve your exact apps and intents
+        // App list - NOTE: Messages intentionally NOT present on home grid.
         val apps = listOf(
             AppInfo("Browser", Intent(this, WebViewActivity::class.java), R.drawable.ic_browser),
             AppInfo("Camera", Intent(this, CameraActivity::class.java), R.drawable.ic_camera),
             AppInfo("WhosApp", Intent(this, WhosAppActivity::class.java), R.drawable.ic_whosapp),
-            AppInfo("Messages", Intent(this, MessagesActivity::class.java), R.drawable.ic_messages),
+            // Messages intentionally not exposed here; reachable only from ALT notifications.
             AppInfo("Gallery", Intent(this, GalleryActivity::class.java), R.drawable.ic_gallery),
             AppInfo("Settings", Intent(this, SettingsActivity::class.java), R.drawable.ic_settings)
         )
@@ -93,10 +92,9 @@ class FakeHomeActivity : AppCompatActivity() {
         val adapter = AppAdapter(this, apps)
         grid.adapter = adapter
 
-        // Ensure GridView uses 3 columns consistently (also helps proper measuring)
+        // Ensure GridView uses 3 columns consistently
         grid.numColumns = 3
 
-        // Logging
         FileLogger.d(this, "FakeHomeActivity", "Number of apps: ${apps.size}")
         FileLogger.d(this, "FakeHomeActivity", "Grid adapter set: ${grid.adapter != null}")
 
@@ -136,7 +134,7 @@ class FakeHomeActivity : AppCompatActivity() {
             FileLogger.d(this, "FakeHomeActivity", "Recent button clicked")
         }
 
-        // Force layout refresh (keeps your original attempt to nudge the layout)
+        // Force layout refresh
         handler.postDelayed({
             grid.invalidate()
             grid.requestLayout()
@@ -210,15 +208,11 @@ class FakeHomeActivity : AppCompatActivity() {
                 FileLogger.e(parent.context, "AppAdapter", "Failed to set icon for ${app.name}: ${e.message}")
             }
 
-            // ---- Important: forward child clicks to GridView so the Activity's onItemClickListener runs ----
-            // If the child view consumes clicks (common when using selectableItemBackground or clickable children),
-            // onItemClick may not be delivered. Calling parent.performItemClick(...) triggers the GridView callback.
+            // forward child clicks to GridView so onItemClick runs
             view.setOnClickListener { v ->
                 try {
-                    // parent is the GridView (ViewGroup). performItemClick will call the registered OnItemClickListener.
                     (parent as? AdapterView<*>)?.performItemClick(v, position, getItemId(position))
                 } catch (t: Throwable) {
-                    // In case of unexpected cast issues, fall back to direct start (keeps behavior resilient)
                     try {
                         val ctx = parent.context
                         ctx.startActivity(apps[position].intent)
@@ -226,7 +220,6 @@ class FakeHomeActivity : AppCompatActivity() {
                 }
             }
 
-            // ensure the view remains focusable/clickable (for ripple). Child click handler will forward to GridView.
             view.isClickable = true
             view.isFocusable = true
 
