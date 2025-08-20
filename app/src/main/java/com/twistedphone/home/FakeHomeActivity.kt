@@ -1,62 +1,54 @@
 package com.twistedphone.home
 
-import com.twistedphone.util.FileLogger
-import android.content.Context
 import android.content.Intent
 import android.os.Bundle
-import android.view.LayoutInflater
-import android.view.View
-import android.view.ViewGroup
+import android.os.Handler
+import android.os.Looper
 import android.widget.*
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.appcompat.content.res.AppCompatResources
 import com.twistedphone.R
 import com.twistedphone.TwistedApp
+import com.twistedphone.alt.AltMessageService
 import com.twistedphone.browser.WebViewActivity
 import com.twistedphone.camera.CameraActivity
 import com.twistedphone.gallery.GalleryActivity
-import com.twistedphone.messages.MessagesActivity
 import com.twistedphone.messages.WhosAppActivity
 import com.twistedphone.settings.SettingsActivity
-import java.util.Calendar
-import java.util.Random
-import android.os.Handler
-import android.os.Looper
-import com.twistedphone.alt.AltMessageService
+import com.twistedphone.util.FileLogger
+import java.util.*
 
 class FakeHomeActivity : AppCompatActivity() {
     private lateinit var clock: TextView
     private lateinit var grid: GridView
-    private lateinit var backgroundImage: ImageView
-    private lateinit var dock: LinearLayout
-    private lateinit var statusBar: LinearLayout
     private val handler = Handler(Looper.getMainLooper())
-    private val rnd = Random()
     private val prefs = TwistedApp.instance.settingsPrefs
-    private var originalTime: String = ""
-    private var jitteredTime: String = ""
-    private var jitterIndex: Int = -1
+    private val securePrefs = TwistedApp.instance.securePrefs
 
-    // Jitter tick
-    private val tick = object : Runnable {
+    // Simple jitter effect ticker
+    private val rnd = Random()
+    private val ticker = object : Runnable {
         override fun run() {
-            val now = Calendar.getInstance()
-            val currentTime = String.format("%02d:%02d", now.get(Calendar.HOUR_OF_DAY), now.get(Calendar.MINUTE))
-
-            if (System.currentTimeMillis() % 2000 < 200) {
-                originalTime = currentTime
-                val digitPositions = intArrayOf(0, 1, 3, 4)
-                jitterIndex = digitPositions[rnd.nextInt(digitPositions.size)]
-                val chars = currentTime.toCharArray()
-                chars[jitterIndex] = (rnd.nextInt(10) + '0'.code).toChar()
-                jitteredTime = String(chars)
-                clock.text = jitteredTime
-            } else {
-                clock.text = originalTime.ifEmpty { currentTime }
+            try {
+                val now = Calendar.getInstance()
+                val h = now.get(Calendar.HOUR_OF_DAY)
+                val m = now.get(Calendar.MINUTE)
+                val s = String.format(Locale.US, "%02d:%02d", h, m)
+                // occasionally corrupt a digit for jitter
+                if (System.currentTimeMillis() % 2000 < 200) {
+                    val ci = listOf(0,1,3,4).random()
+                    val chs = s.toCharArray()
+                    chs[ci] = ('0' + rnd.nextInt(10))
+                    clock.text = String(chs)
+                } else {
+                    clock.text = s
+                }
+            } catch (e: Exception) {
+                FileLogger.e(this@FakeHomeActivity, "Ticker", "ticker error: ${e.message}")
+            } finally {
+                handler.postDelayed(this, 200)
             }
-
-            handler.postDelayed(this, 200)
         }
     }
 
@@ -64,131 +56,91 @@ class FakeHomeActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_fake_home)
 
-        // Initialize views
         clock = findViewById(R.id.jitterClock)
         grid = findViewById(R.id.appGrid)
-        backgroundImage = findViewById(R.id.backgroundImage)
-        dock = findViewById(R.id.dock)
-        statusBar = findViewById(R.id.statusBar)
 
-        // Set background image
         try {
-            val bgDrawable = AppCompatResources.getDrawable(this, R.drawable.background)
-            backgroundImage.setImageDrawable(bgDrawable)
+            findViewById<ImageView>(R.id.backgroundImage).setImageDrawable(
+                AppCompatResources.getDrawable(this, R.drawable.background)
+            )
             FileLogger.d(this, "FakeHomeActivity", "Background image set")
         } catch (e: Exception) {
-            FileLogger.e(this, "FakeHomeActivity", "Failed to set background: ${e.message}")
+            FileLogger.e(this, "FakeHomeActivity", "Background image set failed: ${e.message}")
         }
 
-        // Set install_time if not already set
-        val securePrefs = TwistedApp.instance.securePrefs
-        if (securePrefs.getLong("install_time", 0L) == 0L) {
-            securePrefs.edit().putLong("install_time", System.currentTimeMillis()).apply()
-        }
+        // set install time if missing
+        if (securePrefs.getLong("install_time", 0L) == 0L) securePrefs.edit().putLong("install_time", System.currentTimeMillis()).apply()
 
-        // App list - keep your apps
+        // Build the home grid — NOTE: Messages intentionally NOT listed here (accessible only from notifications)
         val apps = listOf(
             AppInfo("Browser", Intent(this, WebViewActivity::class.java), R.drawable.ic_browser),
             AppInfo("Camera", Intent(this, CameraActivity::class.java), R.drawable.ic_camera),
             AppInfo("WhosApp", Intent(this, WhosAppActivity::class.java), R.drawable.ic_whosapp),
-            AppInfo("Messages", Intent(this, MessagesActivity::class.java), R.drawable.ic_messages),
             AppInfo("Gallery", Intent(this, GalleryActivity::class.java), R.drawable.ic_gallery),
             AppInfo("Settings", Intent(this, SettingsActivity::class.java), R.drawable.ic_settings)
         )
 
-        // Set up GridView adapter
-        val adapter = AppAdapter(this, apps)
-        grid.adapter = adapter
         grid.numColumns = 3
+        grid.adapter = AppAdapter(this, apps)
 
-        // GridView click handling - ALL apps unlocked from the start
         grid.setOnItemClickListener { _, _, pos, _ ->
-            val appName = apps[pos].name
-            if (isAppUnlocked(appName)) {
-                try {
-                    startActivity(apps[pos].intent)
-                    FileLogger.d(this, "FakeHomeActivity", "Launching app: $appName")
-                } catch (t: Throwable) {
-                    FileLogger.e(this, "FakeHomeActivity", "Failed to launch $appName: ${t.message}")
-                    Toast.makeText(this, "Unable to open $appName", Toast.LENGTH_SHORT).show()
-                }
-            } else {
-                // Shouldn't happen now but keep message
-                Toast.makeText(this, "$appName is locked. Wait for unlock.", Toast.LENGTH_SHORT).show()
-                FileLogger.d(this, "FakeHomeActivity", "Blocked launch (locked): $appName")
+            val app = apps[pos]
+            try {
+                startActivity(app.intent)
+                FileLogger.d(this, "FakeHomeActivity", "Launching app: ${app.name}")
+            } catch (t: Throwable) {
+                FileLogger.e(this, "FakeHomeActivity", "Failed to launch ${app.name}: ${t.message}")
+                Toast.makeText(this, "Unable to open ${app.name}", Toast.LENGTH_SHORT).show()
             }
         }
 
-        // Dock buttons
         findViewById<ImageButton>(R.id.btnBack).setOnClickListener { finish() }
-        val homeBtn = findViewById<ImageButton>(R.id.btnHome)
-        homeBtn.setOnClickListener { /* no-op (already home) */ }
-        homeBtn.setOnLongClickListener {
+        findViewById<ImageButton>(R.id.btnHome).setOnClickListener { /* no-op */ }
+        findViewById<ImageButton>(R.id.btnRecent).setOnClickListener { /* no-op */ }
+        findViewById<ImageButton>(R.id.btnHome).setOnLongClickListener {
             showLogDialog(); true
         }
-        findViewById<ImageButton>(R.id.btnRecent).setOnClickListener { /* no-op */ }
 
-        // Force layout refresh
-        handler.postDelayed({
-            grid.invalidate()
-            grid.requestLayout()
-            FileLogger.d(this, "FakeHomeActivity", "Forced GridView layout refresh")
-        }, 100L)
+        // Layout refresh shortly after start
+        handler.postDelayed({ grid.invalidate(); grid.requestLayout(); FileLogger.d(this,"FakeHomeActivity","Grid refresh") }, 120)
 
-        // If this is the first time opening home, and it's within 3 minutes of install_time, trigger immediate AS message
+        // Schedule Alternative Self message at a random time within 3 minutes AFTER home opens (do not count "startup" duration)
         val firstHomeSeenKey = "first_home_seen"
         if (!prefs.getBoolean(firstHomeSeenKey, false)) {
             prefs.edit().putBoolean(firstHomeSeenKey, true).apply()
-            val installTime = securePrefs.getLong("install_time", System.currentTimeMillis())
-            val now = System.currentTimeMillis()
-            if (now - installTime <= 3 * 60 * 1000L) {
-                // start AltMessageService immediately (best-effort)
+            val delayMs = (0L..(3 * 60 * 1000L)).random()
+            FileLogger.d(this, "FakeHomeActivity", "Scheduling AS message in ${delayMs}ms from home open (random within 3min)")
+            handler.postDelayed({
                 try {
                     startService(Intent(this, AltMessageService::class.java))
-                    FileLogger.d(this, "FakeHomeActivity", "Triggered immediate AltMessageService (first home open)")
+                    FileLogger.d(this, "FakeHomeActivity", "Started AltMessageService (scheduled)")
                 } catch (e: Exception) {
-                    FileLogger.e(this, "FakeHomeActivity", "Failed to start AltMessageService: ${e.message}")
+                    FileLogger.e(this, "FakeHomeActivity", "Start AltMessageService failed: ${e.message}")
                 }
-            }
+            }, delayMs)
         }
-    }
-
-    private fun isAppUnlocked(app: String): Boolean {
-        // All apps available from the start (we removed the timed locking behavior)
-        return true
     }
 
     override fun onResume() {
         super.onResume()
-        handler.post(tick)
-        FileLogger.d(this, "FakeHomeActivity", "Activity resumed")
+        handler.post(ticker)
     }
 
     override fun onPause() {
         super.onPause()
-        handler.removeCallbacks(tick)
-        FileLogger.d(this, "FakeHomeActivity", "Activity paused")
+        handler.removeCallbacks(ticker)
     }
 
     private fun showLogDialog() {
         val logs = FileLogger.readAll(this)
-        val tv = TextView(this)
-        tv.text = logs
-        tv.setTextIsSelectable(true)
-        tv.setPadding(20, 20, 20, 20)
-
-        val scroll = ScrollView(this)
-        scroll.addView(tv)
-
-        AlertDialog.Builder(this)
-            .setTitle("TwistedPhone logs")
-            .setView(scroll)
+        val tv = TextView(this).apply { text = logs; setTextIsSelectable(true); setPadding(12,12,12,12) }
+        val scroll = ScrollView(this).apply { addView(tv) }
+        AlertDialog.Builder(this).setTitle("Logs").setView(scroll)
             .setPositiveButton("Share") { _, _ ->
-                val send = Intent(Intent.ACTION_SEND)
-                send.type = "text/plain"
-                send.putExtra(Intent.EXTRA_SUBJECT, "TwistedPhone logs")
-                send.putExtra(Intent.EXTRA_TEXT, logs)
-                startActivity(Intent.createChooser(send, "Share logs"))
+                val i = android.content.Intent(android.content.Intent.ACTION_SEND)
+                i.type = "text/plain"
+                i.putExtra(android.content.Intent.EXTRA_TEXT, logs)
+                startActivity(android.content.Intent.createChooser(i, "Share logs"))
             }
             .setNegativeButton("Close", null)
             .show()
@@ -196,40 +148,18 @@ class FakeHomeActivity : AppCompatActivity() {
 
     data class AppInfo(val name: String, val intent: Intent, val iconRes: Int)
 
-    class AppAdapter(context: Context, private val apps: List<AppInfo>) : BaseAdapter() {
-        private val inflater = LayoutInflater.from(context)
-
+    private class AppAdapter(private val ctx: FakeHomeActivity, private val apps: List<AppInfo>) : BaseAdapter() {
+        private val inflater = ctx.layoutInflater
         override fun getCount(): Int = apps.size
         override fun getItem(position: Int): Any = apps[position]
         override fun getItemId(position: Int): Long = position.toLong()
-
-        override fun getView(position: Int, convertView: View?, parent: ViewGroup): View {
+        override fun getView(position: Int, convertView: android.view.View?, parent: android.view.ViewGroup): android.view.View {
             val view = convertView ?: inflater.inflate(R.layout.item_app, parent, false)
             val app = apps[position]
-
-            val appNameView = view.findViewById<TextView>(R.id.appName)
-            val appIconView = view.findViewById<ImageView>(R.id.appIcon)
-
-            appNameView.text = app.name
-            try {
-                val drawable = AppCompatResources.getDrawable(parent.context, app.iconRes)
-                appIconView.setImageDrawable(drawable)
-            } catch (e: Exception) { /* ignore */ }
-
-            view.setOnClickListener { v ->
-                try {
-                    (parent as? AdapterView<*>)?.performItemClick(v, position, getItemId(position))
-                } catch (t: Throwable) {
-                    try {
-                        val ctx = parent.context
-                        ctx.startActivity(apps[position].intent)
-                    } catch (_: Throwable) { }
-                }
-            }
-
-            view.isClickable = true
-            view.isFocusable = true
-
+            val name = view.findViewById<TextView>(R.id.appName)
+            val icon = view.findViewById<android.widget.ImageView>(R.id.appIcon)
+            name.text = app.name
+            try { icon.setImageDrawable(AppCompatResources.getDrawable(ctx, app.iconRes)) } catch (_: Exception) {}
             return view
         }
     }
