@@ -8,6 +8,7 @@ import android.graphics.drawable.BitmapDrawable
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.util.Log
 import android.view.LayoutInflater
 import android.view.View
 import android.view.ViewGroup
@@ -31,27 +32,40 @@ import java.util.Random
 
 class FakeHomeActivity : AppCompatActivity() {
     private lateinit var clock: TextView
+    private lateinit var grid: GridView
     private val handler = Handler(Looper.getMainLooper())
     private val rnd = Random()
     private val prefs = TwistedApp.instance.settingsPrefs
+    private var originalTime: String = ""
+    private var jitteredTime: String = ""
+    private var jitterIndex: Int = -1
+
     private val tick = object : Runnable {
         override fun run() {
             val now = Calendar.getInstance()
-            // Only jitter every 5 seconds with a 30% chance
-            if (rnd.nextFloat() < 0.3f && System.currentTimeMillis() % 5000 < 1000) {
-                // Apply jitter: randomly change one digit
-                val currentTime = String.format("%02d:%02d", now.get(Calendar.HOUR_OF_DAY), now.get(Calendar.MINUTE))
+            val currentTime = String.format("%02d:%02d", now.get(Calendar.HOUR_OF_DAY), now.get(Calendar.MINUTE))
+            
+            // Every 2 seconds, change a random digit
+            if (System.currentTimeMillis() % 2000 < 100) {
+                // Save original time
+                originalTime = currentTime
+                
+                // Choose a random digit to jitter (positions 0,1,3,4 are digits in HH:MM format)
+                val digitPositions = intArrayOf(0, 1, 3, 4)
+                jitterIndex = digitPositions[rnd.nextInt(digitPositions.size)]
+                
+                // Create jittered time with one random digit changed
                 val chars = currentTime.toCharArray()
-                val randomIndex = rnd.nextInt(chars.size)
-                if (chars[randomIndex].isDigit()) {
-                    chars[randomIndex] = (rnd.nextInt(10) + '0'.code).toChar()
-                }
-                clock.text = String(chars)
+                chars[jitterIndex] = (rnd.nextInt(10) + '0'.code).toChar()
+                jitteredTime = String(chars)
+                
+                clock.text = jitteredTime
             } else {
-                // Normal time
-                clock.text = String.format("%02d:%02d", now.get(Calendar.HOUR_OF_DAY), now.get(Calendar.MINUTE))
+                // Show normal time
+                clock.text = originalTime
             }
-            handler.postDelayed(this, 1000)
+            
+            handler.postDelayed(this, 100) // Update every 100ms for smooth animation
         }
     }
     
@@ -59,8 +73,11 @@ class FakeHomeActivity : AppCompatActivity() {
         super.onCreate(s)
         setContentView(R.layout.activity_fake_home)
         
+        // Initialize views
+        clock = findViewById(R.id.jitterClock)
+        grid = findViewById(R.id.appGrid)
+        
         // Set background if available
-        // Replace the background setting code in onCreate() with this:
         try {
             // First try to use the custom background
             val background = BitmapFactory.decodeResource(resources, R.drawable.background)
@@ -75,38 +92,7 @@ class FakeHomeActivity : AppCompatActivity() {
         } catch (e: Exception) {
             // Use default background if custom background isn't available
             findViewById<View>(android.R.id.content).rootView.setBackgroundColor(0xFF1A1A1A.toInt())
-            android.util.Log.e("FakeHomeActivity", "Failed to load background: ${e.message}")
-        }
-        
-        // Replace the clock-related code in FakeHomeActivity.kt with this:
-        private lateinit var clock: TextView
-        private val handler = Handler(Looper.getMainLooper())
-        private val rnd = Random()
-        private var originalTime: String = ""
-        private var jitteredTime: String = ""
-        private var jitterIndex: Int = -1
-        private val tick = object : Runnable {
-            override fun run() {
-                val now = Calendar.getInstance()
-                val currentTime = String.format("%02d:%02d", now.get(Calendar.HOUR_OF_DAY), now.get(Calendar.MINUTE))
-                // Every 2 seconds, change a random digit
-                if (System.currentTimeMillis() % 2000 < 100) {
-                    // Save original time
-                    originalTime = currentTime
-                    // Choose a random digit to jitter (positions 0,1,3,4 are digits in HH:MM format)
-                    val digitPositions = intArrayOf(0, 1, 3, 4)
-                    jitterIndex = digitPositions[rnd.nextInt(digitPositions.size)]
-                    // Create jittered time with one random digit changed
-                    val chars = currentTime.toCharArray()
-                    chars[jitterIndex] = (rnd.nextInt(10) + '0'.code).toChar()
-                    jitteredTime = String(chars)
-                    clock.text = jitteredTime
-                } else {
-                    // Show normal time
-                    clock.text = originalTime
-                }
-                handler.postDelayed(this, 100) // Update every 100ms for smooth animation
-            }
+            Log.e("FakeHomeActivity", "Failed to load background: ${e.message}")
         }
         
         // Create app list with icons
