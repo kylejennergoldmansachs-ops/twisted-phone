@@ -77,7 +77,7 @@ class FakeHomeActivity : AppCompatActivity() {
         clock = findViewById(R.id.jitterClock)
         grid = findViewById(R.id.appGrid)
         
-        // Replace the background setting code in onCreate() with this:
+        // Set background if available
         try {
             val background = BitmapFactory.decodeResource(resources, R.drawable.background)
             val rootLayout = findViewById<android.widget.RelativeLayout>(R.id.rootLayout)
@@ -85,7 +85,7 @@ class FakeHomeActivity : AppCompatActivity() {
             Log.d("FakeHomeActivity", "Background loaded successfully")
         } catch (e: Exception) {
             Log.e("FakeHomeActivity", "Failed to load background: ${e.message}")
-            // The black background is already set in XML, so no need to set it here
+            // The black background is already set in XML
         }
         
         // Create app list with icons
@@ -100,18 +100,33 @@ class FakeHomeActivity : AppCompatActivity() {
         
         grid.numColumns = 3
         grid.adapter = AppAdapter(this, apps)
+        
+        // Debug logging
+        Log.d("FakeHomeActivity", "Number of apps: ${apps.size}")
+        Log.d("FakeHomeActivity", "Grid adapter set: ${grid.adapter != null}")
+        
         grid.setOnItemClickListener { _, _, pos, _ -> 
             val appName = apps[pos].name
             if (isAppUnlocked(appName)) {
                 startActivity(apps[pos].intent)
+                Log.d("FakeHomeActivity", "Launching app: $appName")
             } else {
                 Toast.makeText(this, "$appName is locked. Wait for unlock.", Toast.LENGTH_SHORT).show()
             }
         }
         
-        findViewById<ImageButton>(R.id.btnBack).setOnClickListener { finish() }
-        findViewById<ImageButton>(R.id.btnHome).setOnClickListener { /* stay home */ }
-        findViewById<ImageButton>(R.id.btnRecent).setOnClickListener { /* show recent, placeholder */ }
+        findViewById<ImageButton>(R.id.btnBack).setOnClickListener { 
+            Log.d("FakeHomeActivity", "Back button clicked")
+            finish() 
+        }
+        findViewById<ImageButton>(R.id.btnHome).setOnClickListener { 
+            Log.d("FakeHomeActivity", "Home button clicked")
+            // Stay on home screen
+        }
+        findViewById<ImageButton>(R.id.btnRecent).setOnClickListener { 
+            Log.d("FakeHomeActivity", "Recent button clicked")
+            // Show recent apps (placeholder)
+        }
     }
     
     private fun isAppUnlocked(app: String): Boolean {
@@ -120,12 +135,14 @@ class FakeHomeActivity : AppCompatActivity() {
     
     override fun onResume() { 
         super.onResume()
-        handler.post(tick) 
+        handler.post(tick)
+        Log.d("FakeHomeActivity", "Activity resumed")
     }
     
     override fun onPause() { 
         super.onPause()
-        handler.removeCallbacks(tick) 
+        handler.removeCallbacks(tick)
+        Log.d("FakeHomeActivity", "Activity paused")
     }
     
     data class AppInfo(val name: String, val intent: Intent, val iconRes: Int)
@@ -140,8 +157,18 @@ class FakeHomeActivity : AppCompatActivity() {
         override fun getView(position: Int, convertView: View?, parent: ViewGroup): View {
             val view = convertView ?: inflater.inflate(R.layout.item_app, parent, false)
             val app = apps[position]
-            view.findViewById<TextView>(R.id.appName).text = app.name
-            view.findViewById<ImageView>(R.id.appIcon).setImageResource(app.iconRes)
+            
+            val appNameView = view.findViewById<TextView>(R.id.appName)
+            val appIconView = view.findViewById<ImageView>(R.id.appIcon)
+            
+            appNameView.text = app.name
+            try {
+                appIconView.setImageResource(app.iconRes)
+                Log.d("AppAdapter", "Set icon for ${app.name}: ${app.iconRes}")
+            } catch (e: Exception) {
+                Log.e("AppAdapter", "Failed to set icon for ${app.name}: ${e.message}")
+            }
+            
             return view
         }
     }
