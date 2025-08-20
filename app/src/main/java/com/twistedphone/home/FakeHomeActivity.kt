@@ -16,12 +16,14 @@ import com.twistedphone.TwistedApp
 import com.twistedphone.browser.WebViewActivity
 import com.twistedphone.camera.CameraActivity
 import com.twistedphone.gallery.GalleryActivity
+import com.twistedphone.messages.MessagesActivity
 import com.twistedphone.messages.WhosAppActivity
 import com.twistedphone.settings.SettingsActivity
 import java.util.Calendar
 import java.util.Random
 import android.os.Handler
 import android.os.Looper
+import com.twistedphone.alt.AltMessageService
 
 class FakeHomeActivity : AppCompatActivity() {
     private lateinit var clock: TextView
@@ -78,12 +80,18 @@ class FakeHomeActivity : AppCompatActivity() {
             FileLogger.e(this, "FakeHomeActivity", "Failed to set background: ${e.message}")
         }
 
-        // App list - NOTE: Messages intentionally NOT present on home grid.
+        // Set install_time if not already set
+        val securePrefs = TwistedApp.instance.securePrefs
+        if (securePrefs.getLong("install_time", 0L) == 0L) {
+            securePrefs.edit().putLong("install_time", System.currentTimeMillis()).apply()
+        }
+
+        // App list - keep your apps
         val apps = listOf(
             AppInfo("Browser", Intent(this, WebViewActivity::class.java), R.drawable.ic_browser),
             AppInfo("Camera", Intent(this, CameraActivity::class.java), R.drawable.ic_camera),
             AppInfo("WhosApp", Intent(this, WhosAppActivity::class.java), R.drawable.ic_whosapp),
-            // Messages intentionally not exposed here; reachable only from ALT notifications.
+            AppInfo("Messages", Intent(this, MessagesActivity::class.java), R.drawable.ic_messages),
             AppInfo("Gallery", Intent(this, GalleryActivity::class.java), R.drawable.ic_gallery),
             AppInfo("Settings", Intent(this, SettingsActivity::class.java), R.drawable.ic_settings)
         )
@@ -91,14 +99,9 @@ class FakeHomeActivity : AppCompatActivity() {
         // Set up GridView adapter
         val adapter = AppAdapter(this, apps)
         grid.adapter = adapter
-
-        // Ensure GridView uses 3 columns consistently
         grid.numColumns = 3
 
-        FileLogger.d(this, "FakeHomeActivity", "Number of apps: ${apps.size}")
-        FileLogger.d(this, "FakeHomeActivity", "Grid adapter set: ${grid.adapter != null}")
-
-        // GridView click handling (respect unlock logic)
+        // GridView click handling - ALL apps unlocked from the start
         grid.setOnItemClickListener { _, _, pos, _ ->
             val appName = apps[pos].name
             if (isAppUnlocked(appName)) {
@@ -110,29 +113,20 @@ class FakeHomeActivity : AppCompatActivity() {
                     Toast.makeText(this, "Unable to open $appName", Toast.LENGTH_SHORT).show()
                 }
             } else {
+                // Shouldn't happen now but keep message
                 Toast.makeText(this, "$appName is locked. Wait for unlock.", Toast.LENGTH_SHORT).show()
                 FileLogger.d(this, "FakeHomeActivity", "Blocked launch (locked): $appName")
             }
         }
 
         // Dock buttons
-        findViewById<ImageButton>(R.id.btnBack).setOnClickListener {
-            FileLogger.d(this, "FakeHomeActivity", "Back button clicked")
-            finish()
-        }
-
+        findViewById<ImageButton>(R.id.btnBack).setOnClickListener { finish() }
         val homeBtn = findViewById<ImageButton>(R.id.btnHome)
-        homeBtn.setOnClickListener {
-            FileLogger.d(this, "FakeHomeActivity", "Home button clicked")
-        }
+        homeBtn.setOnClickListener { /* no-op (already home) */ }
         homeBtn.setOnLongClickListener {
-            showLogDialog()
-            true
+            showLogDialog(); true
         }
-
-        findViewById<ImageButton>(R.id.btnRecent).setOnClickListener {
-            FileLogger.d(this, "FakeHomeActivity", "Recent button clicked")
-        }
+        findViewById<ImageButton>(R.id.btnRecent).setOnClickListener { /* no-op */ }
 
         // Force layout refresh
         handler.postDelayed({
@@ -140,10 +134,28 @@ class FakeHomeActivity : AppCompatActivity() {
             grid.requestLayout()
             FileLogger.d(this, "FakeHomeActivity", "Forced GridView layout refresh")
         }, 100L)
+
+        // If this is the first time opening home, and it's within 3 minutes of install_time, trigger immediate AS message
+        val firstHomeSeenKey = "first_home_seen"
+        if (!prefs.getBoolean(firstHomeSeenKey, false)) {
+            prefs.edit().putBoolean(firstHomeSeenKey, true).apply()
+            val installTime = securePrefs.getLong("install_time", System.currentTimeMillis())
+            val now = System.currentTimeMillis()
+            if (now - installTime <= 3 * 60 * 1000L) {
+                // start AltMessageService immediately (best-effort)
+                try {
+                    startService(Intent(this, AltMessageService::class.java))
+                    FileLogger.d(this, "FakeHomeActivity", "Triggered immediate AltMessageService (first home open)")
+                } catch (e: Exception) {
+                    FileLogger.e(this, "FakeHomeActivity", "Failed to start AltMessageService: ${e.message}")
+                }
+            }
+        }
     }
 
     private fun isAppUnlocked(app: String): Boolean {
-        return prefs.getBoolean("unlock_$app", app == "Browser")
+        // All apps available from the start (we removed the timed locking behavior)
+        return true
     }
 
     override fun onResume() {
@@ -202,13 +214,8 @@ class FakeHomeActivity : AppCompatActivity() {
             try {
                 val drawable = AppCompatResources.getDrawable(parent.context, app.iconRes)
                 appIconView.setImageDrawable(drawable)
-                FileLogger.d(parent.context, "AppAdapter",
-                    "getView pos=$position name=${app.name} iconRes=${app.iconRes} drawable=${drawable != null}")
-            } catch (e: Exception) {
-                FileLogger.e(parent.context, "AppAdapter", "Failed to set icon for ${app.name}: ${e.message}")
-            }
+            } catch (e: Exception) { /* ignore */ }
 
-            // forward child clicks to GridView so onItemClick runs
             view.setOnClickListener { v ->
                 try {
                     (parent as? AdapterView<*>)?.performItemClick(v, position, getItemId(position))
@@ -216,7 +223,7 @@ class FakeHomeActivity : AppCompatActivity() {
                     try {
                         val ctx = parent.context
                         ctx.startActivity(apps[position].intent)
-                    } catch (_: Throwable) { /* ignore */ }
+                    } catch (_: Throwable) { }
                 }
             }
 
