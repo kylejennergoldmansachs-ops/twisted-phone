@@ -4,7 +4,17 @@
     android:layout_width="match_parent"
     android:layout_height="match_parent"
     android:background="#000000">
-    <!-- Status bar (explicitly pinned to top) -->
+
+    <!-- Background image (first child = bottom layer) -->
+    <ImageView
+        android:id="@+id/backgroundImage"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:scaleType="centerCrop"
+        android:contentDescription="@null"
+        android:src="@drawable/background" />
+
+    <!-- Status bar (explicitly aligned to top) -->
     <LinearLayout
         android:id="@+id/statusBar"
         android:layout_alignParentTop="true"
@@ -12,6 +22,7 @@
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:padding="12dp">
+
         <TextView
             android:id="@+id/jitterClock"
             android:text="00:00"
@@ -19,17 +30,20 @@
             android:textSize="18sp"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content" />
+
         <View
             android:layout_width="0dp"
             android:layout_height="wrap_content"
             android:layout_weight="1" />
+
         <ImageView
             android:layout_width="24dp"
             android:layout_height="24dp"
-            android:src="@drawable/distorted_battery" />
+            android:src="@drawable/distorted_battery"
+            android:contentDescription="@null" />
     </LinearLayout>
-    <!-- App grid - explicitly placed between statusBar and dock. Clip-to-padding disabled and bottom padding
-         leaves room so dock doesn't visually cover the last row. Also center gravity and stretch mode. -->
+
+    <!-- App grid - explicitly between statusBar and dock -->
     <GridView
         android:id="@+id/appGrid"
         android:layout_below="@id/statusBar"
@@ -43,9 +57,10 @@
         android:horizontalSpacing="8dp"
         android:stretchMode="columnWidth"
         android:gravity="center"
-        android:clipToPadding="false"
-        android:paddingBottom="96dp" />
-    <!-- Dock pinned to bottom -->
+        android:paddingTop="12dp"
+        android:paddingBottom="12dp" />
+
+    <!-- Dock (bottom) -->
     <LinearLayout
         android:id="@+id/dock"
         android:orientation="horizontal"
@@ -54,28 +69,29 @@
         android:layout_height="wrap_content"
         android:gravity="center"
         android:padding="8dp">
+
         <ImageButton
             android:id="@+id/btnBack"
             android:src="@drawable/distorted_back"
             android:layout_width="48dp"
             android:layout_height="48dp"
-            android:background="@null"
-            android:contentDescription="Back" />
+            android:background="@null" />
+
         <ImageButton
             android:id="@+id/btnHome"
             android:src="@drawable/distorted_home"
             android:layout_width="48dp"
             android:layout_height="48dp"
             android:layout_marginStart="16dp"
-            android:background="@null"
-            android:contentDescription="Home" />
+            android:background="@null" />
+
         <ImageButton
             android:id="@+id/btnRecent"
             android:src="@drawable/distorted_recent"
             android:layout_width="48dp"
             android:layout_height="48dp"
             android:layout_marginStart="16dp"
-            android:background="@null"
-            android:contentDescription="Recent" />
+            android:background="@null" />
     </LinearLayout>
+
 </RelativeLayout>
