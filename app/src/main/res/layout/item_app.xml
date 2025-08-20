@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
-    android:layout_width="wrap_content"
-    android:layout_height="wrap_content"
+    android:layout_width="80dp"
+    android:layout_height="100dp"
     android:orientation="vertical"
     android:gravity="center"
     android:padding="8dp">
@@ -10,13 +10,16 @@
         android:id="@+id/appIcon"
         android:layout_width="48dp"
         android:layout_height="48dp"
-        android:scaleType="centerInside"/>
+        android:scaleType="centerInside"
+        android:src="@drawable/ic_launcher" />
 
     <TextView
         android:id="@+id/appName"
         android:layout_width="wrap_content"
         android:layout_height="wrap_content"
         android:textColor="@android:color/white"
-        android:textSize="12sp"/>
+        android:textSize="12sp"
+        android:maxLines="1"
+        android:ellipsize="end" />
 
 </LinearLayout>
