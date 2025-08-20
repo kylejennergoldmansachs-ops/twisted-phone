@@ -11,9 +11,25 @@ import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONArray
 import org.json.JSONObject
-import java.util.*
+import java.io.ByteArrayOutputStream
+import java.net.URL
 import kotlin.random.Random
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.util.Base64
+import com.google.android.gms.tasks.Tasks
+import com.google.mlkit.vision.common.InputImage
+import com.google.mlkit.vision.face.FaceDetection
+import com.google.mlkit.vision.face.FaceDetectorOptions
+import java.io.IOException
 
+/**
+ * Robust MistralClient used across the app.
+ * - Uses TwistedApp.instance as a Context for logging.
+ * - Provides: callAgent, parseAgentResponse, twistTextWithRetries,
+ *   generateAltMessage, getImageDescription, transformImageToDataUri
+ * - Retries are randomized between 2s and 7s on errors.
+ */
 class MistralClient {
     private val client = OkHttpClient()
     private val prefs = TwistedApp.instance.securePrefs
@@ -22,173 +38,215 @@ class MistralClient {
     private fun textAgent(): String = prefs.getString("text_agent", "") ?: ""
     private fun pixAgent(): String = prefs.getString("pix_agent", "") ?: ""
 
-    /**
-     * Low-level call used by many helpers. Sends agent completions request and returns raw body or empty string.
-     */
     private suspend fun callAgent(agentId: String, inputText: String): String = withContext(Dispatchers.IO) {
         val key = apiKey()
         if (key.isBlank()) {
-            FileLogger.e(this@MistralClient, "MistralClient", "No Mistral API key configured")
+            FileLogger.e(TwistedApp.instance, "MistralClient", "No Mistral API key configured")
             return@withContext ""
         }
         val payload = JSONObject().apply {
             put("agent", agentId)
             put("input", JSONObject().put("text", inputText))
-            // No conversation context (for now); agents can be stateful if set up server-side.
         }
         val body = payload.toString().toRequestBody("application/json".toMediaType())
-        val req = Request.Builder().url("https://api.mistral.ai/v1/agents/completions")
+        val req = Request.Builder()
+            .url("https://api.mistral.ai/v1/agents/completions")
             .addHeader("Authorization", "Bearer $key")
             .addHeader("Accept", "application/json")
             .post(body)
             .build()
-
         try {
-            FileLogger.d(this@MistralClient, "MistralClient", "callAgent -> POST /agents/completions agent=$agentId input=${inputText.take(240)}")
+            FileLogger.d(TwistedApp.instance, "MistralClient", "callAgent agent=$agentId prompt=${inputText.take(240)}")
             client.newCall(req).execute().use { resp ->
                 val code = resp.code
                 val s = resp.body?.string() ?: ""
-                FileLogger.d(this@MistralClient, "MistralClient", "callAgent response code=$code body=${s.take(1000)}")
-                if (!resp.isSuccessful) {
-                    return@withContext ""
-                }
+                FileLogger.d(TwistedApp.instance, "MistralClient", "callAgent response code=$code body=${s.take(1200)}")
+                if (!resp.isSuccessful) return@withContext ""
                 return@withContext s
             }
         } catch (e: Exception) {
-            FileLogger.e(this@MistralClient, "MistralClient", "callAgent exception: ${e.message}")
+            FileLogger.e(TwistedApp.instance, "MistralClient", "callAgent exception: ${e.message}")
             ""
         }
     }
 
     /**
-     * Try to extract text result from a Mistral agents completion response.
-     * We accept multiple possible shapes: top-level "output" string, "choices" array,
-     * choices[0].message.content, choices[0].text, choices[0].message, etc.
+     * Best-effort JSON/text parser for Mistral agent responses.
+     * Accepts several possible shapes so the rest of the app doesn't receive gibberish.
      */
     private fun parseAgentResponse(body: String): String {
         if (body.isBlank()) return ""
         try {
             val jo = JSONObject(body)
-            // direct "output"
             if (jo.has("output")) {
                 val o = jo.opt("output")
                 if (o != null) return o.toString()
             }
-            // "choices" array
             if (jo.has("choices")) {
                 val choices = jo.optJSONArray("choices") ?: JSONArray()
                 if (choices.length() > 0) {
                     val c0 = choices.optJSONObject(0) ?: JSONObject()
-                    // try several places
                     if (c0.has("text")) return c0.optString("text", "")
                     if (c0.has("message")) {
                         val msg = c0.opt("message")
                         if (msg is JSONObject) {
-                            // new API shapes may have content: string or list
                             if (msg.has("content")) {
                                 val content = msg.opt("content")
                                 if (content is String) return content
                                 if (content is JSONArray && content.length() > 0) return content.getString(0)
                             }
-                            // sometimes message -> content -> parts
                             val contentArr = msg.optJSONArray("content")
-                            if (contentArr != null && contentArr.length() > 0) {
-                                return contentArr.getString(0)
-                            }
+                            if (contentArr != null && contentArr.length() > 0) return contentArr.getString(0)
                         } else if (msg is String) {
                             return msg
                         }
                     }
-                    // fallback: try "text" at top choice
                     val maybeText = c0.optString("text", "")
                     if (maybeText.isNotBlank()) return maybeText
                 }
             }
-            // last-resort: try to find a top-level "result" string
             if (jo.has("result")) return jo.optString("result", "")
+            if (jo.has("output") && jo.optJSONObject("output")?.has("text") == true) {
+                return jo.optJSONObject("output")!!.optString("text", "")
+            }
         } catch (e: Exception) {
-            // not JSON — often the API returns text directly
-            FileLogger.e(this, "MistralClient", "parseAgentResponse JSON parse failed: ${e.message}")
-            return body
+            // Not JSON or unexpected shape — return raw trimmed string.
+            FileLogger.e(TwistedApp.instance, "MistralClient", "parseAgentResponse JSON parse failed: ${e.message}")
+            return body.trim()
         }
         return ""
     }
 
     /**
-     * Public wrapper: twist text with retries and randomized backoff (2-7s)
+     * Public method used by the Browser to rewrite page text.
+     * Retries up to maxAttempts; waits 2..7s random backoff between attempts.
      */
     suspend fun twistTextWithRetries(input: String, maxAttempts: Int = 3): String {
         if (input.isBlank()) return input
         val agent = textAgent()
         if (agent.isBlank()) {
-            FileLogger.e(this, "MistralClient", "twistTextWithRetries: no textAgent configured; returning original")
+            FileLogger.e(TwistedApp.instance, "MistralClient", "twistTextWithRetries: no text agent configured")
             return input
         }
         var attempt = 0
-        var last: String = ""
         while (attempt < maxAttempts) {
             attempt++
             try {
-                val raw = callAgent(agent, "Rewrite the following text into a darker, stranger, unsettling version while keeping similar length and sentence structure. RETURN ONLY the rewritten text (no explanation):\n\n$input")
+                val raw = callAgent(agent, "Rewrite the following text into a darker, stranger, unsettling version while keeping similar length and sentence structure. RETURN ONLY the rewritten text:\n\n$input")
                 if (raw.isNotBlank()) {
                     val parsed = parseAgentResponse(raw)
                     if (parsed.isNotBlank()) return parsed
                 }
             } catch (e: Exception) {
-                FileLogger.e(this, "MistralClient", "twistText attempt $attempt error: ${e.message}")
+                FileLogger.e(TwistedApp.instance, "MistralClient", "twistText attempt $attempt exception: ${e.message}")
             }
-            last = input
             val wait = Random.nextLong(2000L, 7000L)
-            FileLogger.d(this, "MistralClient", "twistTextWithRetries attempt $attempt failed; waiting ${wait}ms before retry")
+            FileLogger.d(TwistedApp.instance, "MistralClient", "twistTextWithRetries attempt $attempt failed; waiting ${wait}ms")
             delay(wait)
         }
-        FileLogger.d(this, "MistralClient", "All attempts failed; returning original")
-        return last
+        return input
     }
 
     /**
-     * Use Pix agent primarily for alt messages and any image+text tasks.
-     * Prompt is explicit: produce a single short unsettling line, plain text only.
+     * Generate an Alternative Self line. Uses Pix agent if present, otherwise text agent.
+     * Returns a single short line of text (or empty string).
      */
-    suspend fun generateAltMessage(contextHint: String, history: String): String {
-        val agent = pixAgent().ifBlank { textAgent() } // fallback to textAgent
+    suspend fun generateAltMessage(contextHint: String, history: String): String = withContext(Dispatchers.IO) {
+        val agent = pixAgent().ifBlank { textAgent() }
         if (agent.isBlank()) {
-            FileLogger.e(this, "MistralClient", "generateAltMessage: no agent configured")
-            return ""
+            FileLogger.e(TwistedApp.instance, "MistralClient", "generateAltMessage: no agent configured")
+            return@withContext ""
         }
         val prompt = """
-            You are the user's Alternative Self (AI). Using the provided context and message history, produce **one** short, creepy, unsettling line of text addressing the user. Use the user's name if present. DO NOT include JSON, code blocks, or explanations — return only one line of plain text.
+            You are the user's Alternative Self (AI). Using the provided context and message history, produce ONE short, creepy, unsettling line of text addressing the user. Use the user's name if present. RETURN ONLY ONE LINE OF PLAIN TEXT, NO JSON OR MARKUP.
             
             Context: $contextHint
             
             History: $history
         """.trimIndent()
-        FileLogger.d(this, "MistralClient", "generateAltMessage prompt len=${prompt.length}")
         val raw = callAgent(agent, prompt)
         val parsed = parseAgentResponse(raw)
-        FileLogger.d(this, "MistralClient", "generateAltMessage parsed=${parsed.take(200)}")
-        return parsed
+        parsed
     }
 
     /**
-     * transformImageToDataUri (keeps previous behavior): download, darken faces locally and optionally call Pix to warp.
-     * Returns either a data:image/jpeg;base64,... or falls back to original URL.
+     * Used by AltMessageService: takes an image base64 and returns a short description string.
      */
-    suspend fun transformImageToDataUri(url: String, localDarken: Boolean = true): String {
-        try {
-            // (Implementation should be largely the same as what you already had)
-            // Here we call a helper to download and darken faces and then optionally call pixAgent for creepier warp.
-            // For brevity the code uses the existing logic you had (I preserved it in the main repo).
-            // We'll try to reuse any existing local helper if present; otherwise fallback to returning url.
-            // ----
-            // Simple safe fallback behavior implemented here:
-            // Attempt network fetch and return data URI of the failed-but-safest version (or original URL)
-            val raw = callAgent(pixAgent().ifBlank { textAgent() }, "TRANSFORM_IMAGE_PLACEHOLDER")
-            // The API likely won't return image bytes in this simplified fallback; so we return original url.
-            return url
-        } catch (e: Exception) {
-            FileLogger.e(this, "MistralClient", "transformImageToDataUri failed: ${e.message}")
-            return url
+    suspend fun getImageDescription(imageBase64: String): String = withContext(Dispatchers.IO) {
+        val agent = pixAgent().ifBlank { textAgent() }
+        if (agent.isBlank()) return@withContext ""
+        val prompt = "Describe the following image in one short creepy phrase. Return only the phrase."
+        val payload = JSONObject().apply {
+            put("agent", agent)
+            put("input", JSONObject().apply {
+                put("image_base64", imageBase64)
+                put("instructions", prompt)
+            })
         }
+        val body = payload.toString().toRequestBody("application/json".toMediaType())
+        val key = apiKey()
+        val req = Request.Builder().url("https://api.mistral.ai/v1/agents/completions").addHeader("Authorization", "Bearer $key").post(body).build()
+        try {
+            client.newCall(req).execute().use { resp ->
+                val s = resp.body?.string() ?: ""
+                if (!resp.isSuccessful) return@withContext ""
+                val parsed = parseAgentResponse(s)
+                return@withContext parsed
+            }
+        } catch (e: Exception) {
+            FileLogger.e(TwistedApp.instance, "MistralClient", "getImageDescription failed: ${e.message}")
+            ""
+        }
+    }
+
+    /**
+     * Downloads an image and darkens detected faces (fast ML Kit detection).
+     * Returns a data:image/jpeg;base64,... string on success; falls back to the original URL on failure.
+     */
+    suspend fun transformImageToDataUri(url: String, localDarken: Boolean = true): String = withContext(Dispatchers.IO) {
+        val key = apiKey()
+        try {
+            val conn = URL(url).openConnection()
+            conn.connectTimeout = 5000
+            conn.readTimeout = 5000
+            val bmp = BitmapFactory.decodeStream(conn.getInputStream()) ?: return@withContext url
+            val processed = if (localDarken) darkenFaces(bmp) else bmp
+            val baos = ByteArrayOutputStream()
+            processed.compress(Bitmap.CompressFormat.JPEG, 80, baos)
+            val b = baos.toByteArray()
+            val b64 = Base64.encodeToString(b, Base64.NO_WRAP)
+            return@withContext "data:image/jpeg;base64,$b64"
+        } catch (e: IOException) {
+            FileLogger.e(TwistedApp.instance, "MistralClient", "transformImageToDataUri network failed: ${e.message}")
+            return@withContext url
+        } catch (e: Exception) {
+            FileLogger.e(TwistedApp.instance, "MistralClient", "transformImageToDataUri failed: ${e.message}")
+            return@withContext url
+        }
+    }
+
+    private suspend fun darkenFaces(bmp: Bitmap): Bitmap = withContext(Dispatchers.IO) {
+        val options = FaceDetectorOptions.Builder().setPerformanceMode(FaceDetectorOptions.PERFORMANCE_MODE_FAST).build()
+        val detector = FaceDetection.getClient(options)
+        val image = InputImage.fromBitmap(bmp, 0)
+        val newBmp = bmp.copy(Bitmap.Config.ARGB_8888, true)
+        try {
+            val result = Tasks.await(detector.process(image))
+            val canvas = android.graphics.Canvas(newBmp)
+            val paint = android.graphics.Paint().apply { color = 0xCC000000.toInt() }
+            for (face in result) {
+                val b = face.boundingBox
+                val left = b.left.coerceAtLeast(0)
+                val top = b.top.coerceAtLeast(0)
+                val right = b.right.coerceAtMost(newBmp.width)
+                val bottom = b.bottom.coerceAtMost(newBmp.height)
+                if (left < right && top < bottom) {
+                    canvas.drawRect(left.toFloat(), top.toFloat(), right.toFloat(), bottom.toFloat(), paint)
+                }
+            }
+        } catch (e: Exception) {
+            FileLogger.e(TwistedApp.instance, "MistralClient", "darkenFaces error: ${e.message}")
+        }
+        newBmp
     }
 }
