@@ -210,6 +210,26 @@ class FakeHomeActivity : AppCompatActivity() {
                 FileLogger.e(parent.context, "AppAdapter", "Failed to set icon for ${app.name}: ${e.message}")
             }
 
+            // ---- Important: forward child clicks to GridView so the Activity's onItemClickListener runs ----
+            // If the child view consumes clicks (common when using selectableItemBackground or clickable children),
+            // onItemClick may not be delivered. Calling parent.performItemClick(...) triggers the GridView callback.
+            view.setOnClickListener { v ->
+                try {
+                    // parent is the GridView (ViewGroup). performItemClick will call the registered OnItemClickListener.
+                    (parent as? AdapterView<*>)?.performItemClick(v, position, getItemId(position))
+                } catch (t: Throwable) {
+                    // In case of unexpected cast issues, fall back to direct start (keeps behavior resilient)
+                    try {
+                        val ctx = parent.context
+                        ctx.startActivity(apps[position].intent)
+                    } catch (_: Throwable) { /* ignore */ }
+                }
+            }
+
+            // ensure the view remains focusable/clickable (for ripple). Child click handler will forward to GridView.
+            view.isClickable = true
+            view.isFocusable = true
+
             return view
         }
     }
