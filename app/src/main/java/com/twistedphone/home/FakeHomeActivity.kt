@@ -79,7 +79,7 @@ class FakeHomeActivity : AppCompatActivity() {
             FileLogger.e(this, "FakeHomeActivity", "Failed to set background: ${e.message}")
         }
 
-        // App list
+        // App list - preserve your exact apps and intents
         val apps = listOf(
             AppInfo("Browser", Intent(this, WebViewActivity::class.java), R.drawable.ic_browser),
             AppInfo("Camera", Intent(this, CameraActivity::class.java), R.drawable.ic_camera),
@@ -92,17 +92,25 @@ class FakeHomeActivity : AppCompatActivity() {
         // Set up GridView adapter
         val adapter = AppAdapter(this, apps)
         grid.adapter = adapter
-        
+
+        // Ensure GridView uses 3 columns consistently (also helps proper measuring)
+        grid.numColumns = 3
+
         // Logging
         FileLogger.d(this, "FakeHomeActivity", "Number of apps: ${apps.size}")
         FileLogger.d(this, "FakeHomeActivity", "Grid adapter set: ${grid.adapter != null}")
 
-        // GridView click handling
+        // GridView click handling (respect unlock logic)
         grid.setOnItemClickListener { _, _, pos, _ ->
             val appName = apps[pos].name
             if (isAppUnlocked(appName)) {
-                startActivity(apps[pos].intent)
-                FileLogger.d(this, "FakeHomeActivity", "Launching app: $appName")
+                try {
+                    startActivity(apps[pos].intent)
+                    FileLogger.d(this, "FakeHomeActivity", "Launching app: $appName")
+                } catch (t: Throwable) {
+                    FileLogger.e(this, "FakeHomeActivity", "Failed to launch $appName: ${t.message}")
+                    Toast.makeText(this, "Unable to open $appName", Toast.LENGTH_SHORT).show()
+                }
             } else {
                 Toast.makeText(this, "$appName is locked. Wait for unlock.", Toast.LENGTH_SHORT).show()
                 FileLogger.d(this, "FakeHomeActivity", "Blocked launch (locked): $appName")
@@ -114,7 +122,7 @@ class FakeHomeActivity : AppCompatActivity() {
             FileLogger.d(this, "FakeHomeActivity", "Back button clicked")
             finish()
         }
-        
+
         val homeBtn = findViewById<ImageButton>(R.id.btnHome)
         homeBtn.setOnClickListener {
             FileLogger.d(this, "FakeHomeActivity", "Home button clicked")
@@ -123,12 +131,12 @@ class FakeHomeActivity : AppCompatActivity() {
             showLogDialog()
             true
         }
-        
+
         findViewById<ImageButton>(R.id.btnRecent).setOnClickListener {
             FileLogger.d(this, "FakeHomeActivity", "Recent button clicked")
         }
 
-        // Force layout refresh
+        // Force layout refresh (keeps your original attempt to nudge the layout)
         handler.postDelayed({
             grid.invalidate()
             grid.requestLayout()
