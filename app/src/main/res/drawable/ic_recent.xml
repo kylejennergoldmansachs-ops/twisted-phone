@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+    <!-- "apps" / grid icon for recent apps -->
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M4,6h4v4H4V6zM10,6h4v4h-4V6zM16,6h4v4h-4V6zM4,12h4v4H4v-4zM10,12h4v4h-4v-4zM16,12h4v4h-4v-4z"/>
+</vector>
