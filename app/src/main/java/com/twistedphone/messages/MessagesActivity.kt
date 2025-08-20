@@ -16,10 +16,8 @@ import com.twistedphone.alt.AltMessageService
 import com.twistedphone.util.FileLogger
 
 /**
- * MessagesActivity
- * - Displays messages stacked vertically (main text left-aligned, meta line right-aligned)
- * - Uses MessageStore.addMessage(context, who, text) API (two-arg form) to add messages
- * - Updates the UI in-place instead of finishing/restarting the activity
+ * MessagesActivity — displays messages stacked vertically.
+ * Uses MessageStore.addMessage(ctx, who, text) (three-argument form).
  */
 class MessagesActivity : AppCompatActivity() {
 
@@ -38,21 +36,18 @@ class MessagesActivity : AppCompatActivity() {
             val t = input.text.toString().trim()
             if (t.isNotEmpty()) {
                 try {
-                    // MessageStore.addMessage(context, who, text) — use the two-arg form expected by the original project
+                    // Correct call that matches MessageStore.addMessage(ctx, who, text)
                     MessageStore.addMessage(this, "YOU", t)
                 } catch (e: Exception) {
-                    // fallback to a safe append into the store string API if it differs
-                    try {
-                        MessageStore.addMessage(this, "YOU|${System.currentTimeMillis()}|$t")
-                    } catch (ex: Exception) {
-                        FileLogger.e(this, "MessagesActivity", "addMessage fallback failed: ${ex.message}")
-                    }
+                    // Log and return early — do not attempt alternate signatures
+                    FileLogger.e(this, "MessagesActivity", "addMessage failed: ${e.message}")
+                    return@setOnClickListener
                 }
                 input.text.clear()
-                // update UI in-place
+                // Update UI in-place
                 refreshMessages()
 
-                // schedule AS reply after a short delay
+                // schedule AS reply after short delay
                 Handler(Looper.getMainLooper()).postDelayed({
                     try {
                         val svcIntent = Intent(this, AltMessageService::class.java)
@@ -72,11 +67,11 @@ class MessagesActivity : AppCompatActivity() {
             container.removeAllViews()
             val msgs = MessageStore.allMessages(this)
             for (m in msgs) {
-                // expect stored format either "WHO|meta|text" or "WHO|text" or plain text
+                // stored format: "WHO|timestamp|text"
                 val parts = m.split("|", limit = 3)
                 val who = parts.getOrNull(0) ?: ""
                 val meta = parts.getOrNull(1) ?: ""
-                val text = parts.getOrNull(2) ?: if (parts.size >= 2) parts[1] else parts.getOrNull(0) ?: ""
+                val text = parts.getOrNull(2) ?: ""
 
                 val block = LinearLayout(this).apply {
                     orientation = LinearLayout.VERTICAL
