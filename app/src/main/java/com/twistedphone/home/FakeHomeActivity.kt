@@ -151,6 +151,13 @@ class FakeHomeActivity : AppCompatActivity() {
             FileLogger.d(this, "FakeHomeActivity", "Recent button clicked")
         }
 
+        // Force layout refresh to ensure GridView renders
+        handler.postDelayed({
+            grid.invalidate()
+            grid.requestLayout()
+            FileLogger.d(this, "FakeHomeActivity", "Forced GridView layout refresh")
+        }, 100L)
+
         // --- After a short delay confirm visible children; if none visible, create fallback overlay ---
         handler.postDelayed({
             try {
