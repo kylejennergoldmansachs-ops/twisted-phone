@@ -1,6 +1,9 @@
 package com.twistedphone.browser
 
+import android.graphics.Color
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
@@ -9,215 +12,274 @@ import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.widget.*
 import androidx.appcompat.app.AppCompatActivity
+import androidx.core.view.updateLayoutParams
 import com.twistedphone.R
 import com.twistedphone.TwistedApp
 import com.twistedphone.ai.MistralClient
 import kotlinx.coroutines.*
 import org.json.JSONArray
 import org.json.JSONObject
+import kotlin.random.Random
 
+/**
+ * Reworked WebViewActivity:
+ * - Adds a small address bar programmatically (EditText + Go + Back)
+ * - Shows a white overlay while transforming DOM
+ * - Extracts top-10 largest text nodes and top images
+ * - Sends text to Mistral via MistralClient.twistTextWithRetries(...) with retry/backoff
+ * - Downloads images, darkens faces locally via MistralClient.transformImageToDataUri(...)
+ * - Replaces DOM client-side using XPath-based node lookup
+ * - Caches transformations per-URL
+ */
 class WebViewActivity : AppCompatActivity() {
     private lateinit var web: WebView
-    private lateinit var progressBar: ProgressBar
+    private lateinit var progress: ProgressBar
+    private lateinit var overlay: View
     private val scope = CoroutineScope(Dispatchers.Main + Job())
     private val client = MistralClient()
     private val prefs = TwistedApp.instance.settingsPrefs
-    private val cache = mutableMapOf<String, String>() // simple URL to transformed JS replace script
-    private var overlay: FrameLayout? = null
+    private val cache = mutableMapOf<String, String>() // url -> js replacement (cached)
 
     override fun onCreate(s: Bundle?) {
         super.onCreate(s)
-
-        // ensure system bars are visible so the device nav overlays the app
-        window.decorView.systemUiVisibility = View.SYSTEM_UI_FLAG_VISIBLE
-
         setContentView(R.layout.activity_webview)
+
         web = findViewById(R.id.webview)
-        progressBar = findViewById(R.id.progressBar)
+        progress = findViewById(R.id.progressBar)
+
+        // basic webview setup
         web.settings.javaScriptEnabled = true
         web.webChromeClient = WebChromeClient()
         web.webViewClient = object : WebViewClient() {
             override fun onPageFinished(view: WebView?, url: String?) {
-                // show overlay + spinner while we extract & transform
-                showTransformOverlay()
-                performTransformations(url ?: return)
-            }
-            override fun onPageStarted(view: WebView?, url: String?, favicon: android.graphics.Bitmap?) {
-                // make sure overlay is shown during load as well
-                showTransformOverlay()
+                if (url == null) return
+                // show overlay + progress while transforming
+                showOverlay()
+                performTransformations(url)
             }
         }
 
-        // Add a small address bar programmatically so we don't need to edit XML.
+        // Insert a light address bar (programmatically) above the WebView so we don't have to update XML
         addAddressBar()
 
-        // initial URL
+        // initial page
         web.loadUrl("https://en.wikipedia.org/wiki/Main_Page")
     }
 
     private fun addAddressBar() {
-        val root = findViewById<ViewGroup>(android.R.id.content).getChildAt(0) as ViewGroup
+        val root = findViewById<ViewGroup>(android.R.id.content)
+        // container for bar
         val bar = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
-            setPadding(8, 8, 8, 8)
-            layoutParams = FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.WRAP_CONTENT).apply {
-                gravity = Gravity.TOP
-            }
+            setBackgroundColor(Color.parseColor("#F2F2F2"))
             elevation = 8f
-            setBackgroundColor(0xDDFFFFFF.toInt())
+            setPadding(8, 8, 8, 8)
         }
+        val params = FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+        params.gravity = Gravity.TOP
+        bar.layoutParams = params
+
         val urlInput = EditText(this).apply {
-            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
-            hint = "Enter URL or search"
+            hint = "https://"
+            minLines = 1
+            maxLines = 1
             setSingleLine(true)
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
         }
-        val go = Button(this).apply {
+        val btnGo = Button(this).apply {
             text = "Go"
-            setOnClickListener {
-                val raw = urlInput.text.toString().trim()
-                if (raw.isNotEmpty()) {
-                    val url = if (raw.startsWith("http://") || raw.startsWith("https://")) raw else "https://$raw"
-                    web.loadUrl(url)
-                    showTransformOverlay()
-                }
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+        }
+        val btnBack = Button(this).apply {
+            text = "Back"
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+        }
+
+        btnGo.setOnClickListener {
+            val u = urlInput.text.toString().trim()
+            if (u.isNotEmpty()) {
+                val finalUrl = if (u.startsWith("http")) u else "https://$u"
+                web.loadUrl(finalUrl)
             }
         }
+        btnBack.setOnClickListener {
+            if (web.canGoBack()) web.goBack()
+        }
+
         bar.addView(urlInput)
-        bar.addView(go)
+        bar.addView(btnGo)
+        bar.addView(btnBack)
 
-        // insert at top of root view
-        root.addView(bar)
-        // let WebView content be below the bar visually by adding top padding
-        web.setPadding(0, (56 * resources.displayMetrics.density).toInt(), 0, 0)
-        web.clipToPadding = false
+        // place it above content; content view is a FrameLayout so we can add this
+        val parent = root.getChildAt(0) as? ViewGroup
+        parent?.addView(bar)
+
+        // adjust the existing webview top margin so the bar won't cover it
+        web.updateLayoutParams<ViewGroup.MarginLayoutParams> {
+            topMargin = (56 * resources.displayMetrics.density).toInt()
+        }
     }
 
-    private fun showTransformOverlay() {
-        if (overlay != null) {
-            overlay?.visibility = View.VISIBLE
-            return
+    private fun showOverlay() {
+        if (::overlay.isInitialized && overlay.parent != null) return
+        val root = findViewById<ViewGroup>(android.R.id.content)
+        overlay = View(this).apply {
+            setBackgroundColor(Color.WHITE)
+            alpha = 1f
+            isClickable = true
         }
-        val root = findViewById<ViewGroup>(android.R.id.content).getChildAt(0) as ViewGroup
-        overlay = FrameLayout(this).apply {
-            setBackgroundColor(0xFFFFFFFF.toInt()) // white overlay while transforming
-            layoutParams = FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT)
-        }
-        val spinner = ProgressBar(this).apply {
-            isIndeterminate = true
-            val lp = FrameLayout.LayoutParams(FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT)
-            lp.gravity = Gravity.CENTER
-            layoutParams = lp
-        }
-        overlay?.addView(spinner)
-        root.addView(overlay)
-        progressBar.visibility = View.VISIBLE
+        val p = FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
+        (root.getChildAt(0) as ViewGroup).addView(overlay, p)
+        progress.visibility = View.VISIBLE
     }
 
-    private fun hideTransformOverlay() {
-        overlay?.visibility = View.GONE
-        progressBar.visibility = View.GONE
+    private fun hideOverlay() {
+        try {
+            progress.visibility = View.GONE
+            if (::overlay.isInitialized) {
+                val root = findViewById<ViewGroup>(android.R.id.content)
+                (root.getChildAt(0) as ViewGroup).removeView(overlay)
+            }
+        } catch (_: Exception) {}
     }
 
     private fun performTransformations(url: String) {
-        // If we have cached replacement script for this URL, inject it and hide overlay quickly
-        if (cache.containsKey(url)) {
-            web.evaluateJavascript(cache[url]!!, null)
-            // small delay to let DOM settle then hide overlay
-            scope.launch {
-                delay(300)
-                hideTransformOverlay()
-            }
+        // apply cached replacements if present
+        cache[url]?.let { js ->
+            web.evaluateJavascript(js, null)
+            hideOverlay()
             return
         }
 
-        // extract some texts & images via injected JS
+        // JS: collect text nodes (parent xpath, text) and images (src, xpath). We ask for top 10 texts by length.
         val jsExtract = """
             (function(){
                 function getXPath(node) {
-                    let path = '';
+                    if(!node) return '';
+                    var path = '';
                     while (node && node.nodeType == Node.ELEMENT_NODE) {
-                        let sib = node.previousSibling, idx = 1;
+                        var sib = node.previousSibling, idx = 1;
                         while (sib) { if (sib.nodeType == Node.ELEMENT_NODE && sib.tagName == node.tagName) idx++; sib = sib.previousSibling; }
                         path = '/' + node.tagName.toLowerCase() + '[' + idx + ']' + path;
                         node = node.parentNode;
                     }
                     return path;
                 }
-                let texts = [];
-                let walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+                var texts = [];
+                var walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
                 while (walker.nextNode()) {
-                    let text = walker.currentNode.nodeValue.trim();
-                    if (text.length > 30) texts.push({text: text, xpath: getXPath(walker.currentNode.parentNode), len: text.length});
+                    var t = walker.currentNode.nodeValue.trim();
+                    if (t && t.length > 20) {
+                        texts.push({text: t, xpath: getXPath(walker.currentNode.parentNode), len: t.length});
+                    }
                 }
-                texts.sort((a,b) => b.len - a.len);
-                texts = texts.slice(0, 6);
-                let imgs = Array.from(document.images).map(i => ({src: i.src, area: (i.naturalWidth||0)*(i.naturalHeight||0), xpath: getXPath(i)})).sort((a,b)=>b.area-a.area).slice(0,4);
+                texts.sort(function(a,b){ return b.len - a.len; });
+                texts = texts.slice(0, 10);
+                var imgs = Array.from(document.images).map(function(i){ return {src:i.src||'', area:(i.naturalWidth||0)*(i.naturalHeight||0), xpath: getXPath(i)};});
+                imgs.sort(function(a,b){ return b.area - a.area; });
+                imgs = imgs.slice(0, 10);
                 return JSON.stringify({texts: texts, imgs: imgs});
             })();
         """.trimIndent()
 
-        web.evaluateJavascript(jsExtract) { result ->
-            // evaluateJavascript returns a JS string literal (quoted). Unescape using JSONArray trick:
-            val jsonString = try {
-                if (result == null) "{}" else JSONArray("[$result]").getString(0)
-            } catch (e: Exception) {
-                // Fallback: try raw (not ideal)
-                result ?: "{}"
-            }
-
+        web.evaluateJavascript(jsExtract) { rawResult ->
+            val nonNullResult = rawResult ?: "{}"
             scope.launch {
+                // evaluateJavascript returns a quoted JSON string; unwrap carefully
+                val clean = unquoteJsResult(nonNullResult)
                 try {
-                    val jo = JSONObject(jsonString)
-                    val texts = jo.optJSONArray("texts") ?: org.json.JSONArray()
-                    val imgs = jo.optJSONArray("imgs") ?: org.json.JSONArray()
-                    val highUsage = prefs.getBoolean("high_api_usage", false)
-                    val numTexts = if (highUsage) texts.length() else minOf(3, texts.length())
-                    val numImgs = if (highUsage) imgs.length() else minOf(2, imgs.length())
+                    val jo = JSONObject(clean)
+                    val texts = jo.optJSONArray("texts") ?: JSONArray()
+                    val imgs = jo.optJSONArray("imgs") ?: JSONArray()
 
-                    // Collect replacements
-                    val twistedTexts = mutableListOf<Pair<String, String>>()
+                    // number of texts/images to process; always attempt up to 10 texts
+                    val numTexts = minOf(10, texts.length())
+                    val numImgs = minOf(10, imgs.length())
+
+                    // transform texts (concurrent but limited)
+                    val twistedPairs = mutableListOf<Pair<String, String>>() // xpath -> twistedText
+                    val textJobs = mutableListOf<Deferred<Unit>>()
+                    val textScope = CoroutineScope(Dispatchers.IO + Job())
                     for (i in 0 until numTexts) {
-                        val t = texts.getJSONObject(i)
-                        val orig = t.optString("text", "")
-                        if (orig.isBlank()) continue
-                        val twisted = withContext(Dispatchers.IO) { client.twistTextPreserveLength(orig) }
-                        if (twisted.isNotBlank() && twisted != orig) twistedTexts.add(Pair(t.optString("xpath"), twisted))
+                        val tjo = texts.getJSONObject(i)
+                        val original = tjo.optString("text")
+                        val xpath = tjo.optString("xpath")
+                        // launch transform with retry wrapper
+                        val job = textScope.async {
+                            try {
+                                val twisted = client.twistTextWithRetries(original, maxAttempts = 3)
+                                if (twisted.isNotBlank() && twisted != original) {
+                                    synchronized(twistedPairs) { twistedPairs.add(Pair(xpath, twisted)) }
+                                }
+                            } catch (_: Exception) { /* swallow - fallback to original */ }
+                        }
+                        textJobs.add(job)
                     }
 
-                    val imageMap = mutableMapOf<String, String>()
+                    // transform images (concurrent but limited)
+                    val imagePairs = mutableListOf<Pair<String, String>>() // originalSrc -> dataUri
+                    val imgJobs = mutableListOf<Deferred<Unit>>()
+                    val imgScope = CoroutineScope(Dispatchers.IO + Job())
                     for (i in 0 until numImgs) {
-                        val img = imgs.getJSONObject(i)
-                        val src = img.optString("src")
-                        if (src.isBlank()) continue
-                        val transformed = withContext(Dispatchers.IO) { client.transformImageToDataUri(src) }
-                        if (transformed.isNotBlank() && transformed != src) imageMap[src] = transformed
+                        val ijo = imgs.getJSONObject(i)
+                        val src = ijo.optString("src")
+                        if (src.isNullOrBlank()) continue
+                        val job = imgScope.async {
+                            try {
+                                // try to transform image (will darken faces locally and optionally call Pix agent)
+                                val transformed = client.transformImageToDataUri(src, localDarken = true)
+                                if (!transformed.isNullOrBlank() && transformed != src) {
+                                    synchronized(imagePairs) { imagePairs.add(Pair(src, transformed)) }
+                                }
+                            } catch (_: Exception) {}
+                        }
+                        imgJobs.add(job)
                     }
 
-                    // Build replace script
+                    // wait for everything, but cap wait time to avoid locking UI
+                    val allJobs = textJobs + imgJobs
+                    withTimeoutOrNull(15_000L) { allJobs.awaitAll() } // don't wait forever; we have retries inside
+
+                    // Build JavaScript to replace nodes
                     val jsReplace = StringBuilder("(function(){")
-                    for ((xpath, twisted) in twistedTexts) {
-                        // Use innerText on the parent element (the xpath was for the element containing text)
-                        jsReplace.append("try{let el=document.evaluate('$xpath',document,null,XPathResult.FIRST_ORDERED_NODE_TYPE,null).singleNodeValue; if(el) el.innerText = ${JSONObject.quote(twisted)};}catch(e){};")
+                    for ((xpath, twisted) in twistedPairs) {
+                        // safer: set textContent so markup won't be reinterpreted
+                        jsReplace.append("try{ var node = document.evaluate('${escapeJs(xpath)}', document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue; if(node) { node.textContent = ${JSONObject.quote(twisted)}; } }catch(e){};")
                     }
-                    for ((src, trans) in imageMap) {
-                        jsReplace.append("try{let imgs=document.images; for(let i=0;i<imgs.length;i++){ if(imgs[i].src==${JSONObject.quote(src)}) imgs[i].src=${JSONObject.quote(trans)}; }}catch(e){};")
+                    for ((src, trans) in imagePairs) {
+                        jsReplace.append("try{ var imgs=document.images; for(var i=0;i<imgs.length;i++){ if(imgs[i].src==${JSONObject.quote(src)}||imgs[i].src==${JSONObject.quote(src.trim())}) imgs[i].src=${JSONObject.quote(trans)}; } }catch(e){};")
                     }
                     jsReplace.append("})();")
 
-                    // Inject the replacement script
-                    web.evaluateJavascript(jsReplace.toString(), null)
-                    // cache script for quick re-use
-                    cache[url] = jsReplace.toString()
+                    // inject replacements (on UI thread)
+                    withContext(Dispatchers.Main) {
+                        web.evaluateJavascript(jsReplace.toString(), null)
+                        cache[url] = jsReplace.toString()
+                    }
                 } catch (e: Exception) {
-                    // swallow but report
+                    // parsing / replacement failed — swallow and fall back silently
                     e.printStackTrace()
                 } finally {
-                    // ensure overlay is hidden after a small delay so DOM can settle
-                    delay(500)
-                    hideTransformOverlay()
+                    // ensure overlay hidden after a short tidying delay for smoother UX
+                    delay(300)
+                    hideOverlay()
                 }
             }
         }
+    }
+
+    private fun unquoteJsResult(raw: String): String {
+        // raw is often like: "\"{\\\"texts\\\":...}\"" (a quoted JSON string)
+        if (raw.startsWith("\"") && raw.endsWith("\"") && raw.length >= 2) {
+            val inner = raw.substring(1, raw.length - 1)
+            // Undo common JS escaping
+            return inner.replace("\\\\", "\\").replace("\\\"", "\"").replace("\\n", "\n")
+        }
+        return raw
+    }
+
+    private fun escapeJs(s: String): String {
+        return s.replace("'", "\\'")
     }
 
     override fun onDestroy() {
