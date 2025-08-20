@@ -77,22 +77,15 @@ class FakeHomeActivity : AppCompatActivity() {
         clock = findViewById(R.id.jitterClock)
         grid = findViewById(R.id.appGrid)
         
-        // Set background if available
+        // Replace the background setting code in onCreate() with this:
         try {
-            // First try to use the custom background
             val background = BitmapFactory.decodeResource(resources, R.drawable.background)
-            val scaledBackground = Bitmap.createScaledBitmap(
-                background, 
-                resources.displayMetrics.widthPixels,
-                resources.displayMetrics.heightPixels,
-                true
-            )
-            val rootView = findViewById<View>(android.R.id.content).rootView
-            rootView.background = BitmapDrawable(resources, scaledBackground)
+            val rootLayout = findViewById<android.widget.RelativeLayout>(R.id.rootLayout)
+            rootLayout.background = BitmapDrawable(resources, background)
+            Log.d("FakeHomeActivity", "Background loaded successfully")
         } catch (e: Exception) {
-            // Use default background if custom background isn't available
-            findViewById<View>(android.R.id.content).rootView.setBackgroundColor(0xFF1A1A1A.toInt())
             Log.e("FakeHomeActivity", "Failed to load background: ${e.message}")
+            // The black background is already set in XML, so no need to set it here
         }
         
         // Create app list with icons
