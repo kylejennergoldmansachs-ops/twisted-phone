@@ -4,7 +4,7 @@ import android.graphics.Color
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
-import android.util.Base64
+import android.util.Log
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
@@ -20,8 +20,6 @@ import com.twistedphone.util.FileLogger
 import kotlinx.coroutines.*
 import org.json.JSONArray
 import org.json.JSONObject
-import java.net.URLConnection
-import kotlin.random.Random
 
 class WebViewActivity : AppCompatActivity() {
     private lateinit var web: WebView
@@ -45,7 +43,6 @@ class WebViewActivity : AppCompatActivity() {
             override fun onPageStarted(view: WebView?, url: String?, favicon: android.graphics.Bitmap?) {
                 showOverlay()
                 FileLogger.d(this@WebViewActivity, "WebViewActivity", "onPageStarted: $url")
-                // cancel any previous transform tasks to avoid races
                 currentTransformJob?.cancel()
             }
 
@@ -68,10 +65,6 @@ class WebViewActivity : AppCompatActivity() {
             setPadding(8, 8, 8, 8)
             elevation = 6f
         }
-        val lp = FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
-        lp.gravity = Gravity.TOP
-        bar.layoutParams = lp
-
         val et = EditText(this).apply {
             hint = "Enter URL"
             layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
@@ -86,7 +79,6 @@ class WebViewActivity : AppCompatActivity() {
             }
         } }
         val back = Button(this).apply { text = "Back"; setOnClickListener { if (web.canGoBack()) web.goBack() } }
-
         bar.addView(et); bar.addView(go); bar.addView(back)
         (root.getChildAt(0) as ViewGroup).addView(bar)
         web.setPadding(0, (56 * resources.displayMetrics.density).toInt(), 0, 0)
@@ -116,11 +108,9 @@ class WebViewActivity : AppCompatActivity() {
     }
 
     private fun performTransformations(url: String) {
-        // Always start a fresh transform job for each navigation
         currentTransformJob = scope.launch {
             try {
                 FileLogger.d(this@WebViewActivity, "WebViewActivity", "performTransformations start for $url")
-                // Apply cached script quickly if exists to speed up
                 cache[url]?.let { cachedJs ->
                     web.evaluateJavascript(cachedJs, null)
                     FileLogger.d(this@WebViewActivity, "WebViewActivity", "Applied cached transform for $url")
@@ -128,6 +118,7 @@ class WebViewActivity : AppCompatActivity() {
                     return@launch
                 }
 
+                // Extraction JS: only visible text nodes and visible images
                 val jsExtract = """
                 (function(){
                     function getXPath(node){
@@ -141,22 +132,43 @@ class WebViewActivity : AppCompatActivity() {
                         }
                         return path;
                     }
-                    var texts=[]; var walker=document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
-                    while(walker.nextNode()){
-                        var t=walker.currentNode.nodeValue.trim();
-                        if(t && t.length>20) texts.push({text:t,xpath:getXPath(walker.currentNode.parentNode),len:t.length});
+                    function visible(el){
+                        if(!el) return false;
+                        if(el.hasAttribute && el.hasAttribute('hidden')) return false;
+                        var rects = el.getClientRects();
+                        if(!rects || rects.length===0) return false;
+                        var cs = window.getComputedStyle(el);
+                        if(!cs) return true;
+                        if(cs.visibility==='hidden' || cs.display==='none') return false;
+                        if(parseFloat(cs.opacity||1) < 0.1) return false;
+                        return true;
                     }
-                    texts.sort(function(a,b){ return b.len - a.len;});
-                    texts = texts.slice(0, 10);
-                    var imgs = Array.from(document.images).map(function(i){ return {src:i.src||'', area:(i.naturalWidth||0)*(i.naturalHeight||0), xpath:getXPath(i)};});
+                    var walker=document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT,null,false);
+                    var texts=[];
+                    while(walker.nextNode()){
+                        var t = walker.currentNode.nodeValue.trim();
+                        if(!t || t.length < 30) continue;
+                        var parent = walker.currentNode.parentNode;
+                        var tag = parent && parent.tagName ? parent.tagName.toLowerCase() : '';
+                        if(['script','style','noscript','svg','code','pre','head','link','meta'].indexOf(tag) !== -1) continue;
+                        if(!visible(parent)) continue;
+                        if(/^[\.\{\<\[\#\*]/.test(t)) continue;
+                        if(t.indexOf('http') !== -1) continue;
+                        // avoid inline JSON / long attribute strings - heuristic
+                        if(t.indexOf('{')!==-1 && t.indexOf('}')!==-1) continue;
+                        texts.push({text:t, xpath:getXPath(parent), len:t.length});
+                    }
+                    texts.sort(function(a,b){ return b.len - a.len; });
+                    texts = texts.slice(0,10);
+                    var imgs = Array.from(document.images).filter(function(i){ try { return (i.naturalWidth||0) > 40 && (i.src||'').indexOf('http')===0; } catch(e){ return false; }}).map(function(i){ return {src:i.src||'', area:(i.naturalWidth||0)*(i.naturalHeight||0), xpath:getXPath(i)};});
                     imgs.sort(function(a,b){ return b.area - a.area; });
-                    imgs = imgs.slice(0, 10);
+                    imgs = imgs.slice(0,10);
                     return JSON.stringify({texts:texts, imgs:imgs});
                 })();
                 """.trimIndent()
 
                 val raw = evaluateJavascriptSafely(jsExtract)
-                FileLogger.d(this@WebViewActivity, "WebViewActivity", "jsExtract raw: ${raw?.take(200)}")
+                FileLogger.d(this@WebViewActivity, "WebViewActivity", "jsExtract raw: ${raw?.take(400)}")
                 if (raw == null) {
                     FileLogger.e(this@WebViewActivity, "WebViewActivity", "Extraction returned null")
                     hideOverlay(); return@launch
@@ -168,7 +180,6 @@ class WebViewActivity : AppCompatActivity() {
                 val imgs = jo.optJSONArray("imgs") ?: JSONArray()
                 FileLogger.d(this@WebViewActivity, "WebViewActivity", "Found texts=${texts.length()} imgs=${imgs.length()} (top10)")
 
-                // Transform texts concurrently with limit
                 val twistedPairs = mutableListOf<Pair<String,String>>()
                 val textJobs = mutableListOf<Deferred<Unit>>()
                 val textScope = CoroutineScope(Dispatchers.IO + Job())
@@ -179,9 +190,9 @@ class WebViewActivity : AppCompatActivity() {
                     val xpath = tjo.optString("xpath")
                     val job = textScope.async {
                         try {
-                            FileLogger.d(this@WebViewActivity, "WebViewActivity", "Sending to Mistral: ${original.take(160)}...")
+                            FileLogger.d(this@WebViewActivity, "WebViewActivity", "Sending to Mistral: ${original.take(200)}")
                             val twisted = client.twistTextWithRetries(original, maxAttempts = 3)
-                            FileLogger.d(this@WebViewActivity, "WebViewActivity", "Mistral responded (len=${twisted.length}) example: ${twisted.take(160)}")
+                            FileLogger.d(this@WebViewActivity, "WebViewActivity", "Mistral responded (len=${twisted.length}) example: ${twisted.take(200)}")
                             if (twisted.isNotBlank() && twisted != original) synchronized(twistedPairs) { twistedPairs.add(Pair(xpath, twisted)) }
                         } catch (e: Exception) {
                             FileLogger.e(this@WebViewActivity, "WebViewActivity", "text transform failed: ${e.message}")
@@ -190,7 +201,6 @@ class WebViewActivity : AppCompatActivity() {
                     textJobs.add(job)
                 }
 
-                // Transform images concurrently
                 val imgPairs = mutableListOf<Pair<String,String>>()
                 val imgJobs = mutableListOf<Deferred<Unit>>()
                 val imgScope = CoroutineScope(Dispatchers.IO + Job())
@@ -214,7 +224,6 @@ class WebViewActivity : AppCompatActivity() {
                     imgJobs.add(j)
                 }
 
-                // Wait for all transforms but cap the wait time
                 val all = textJobs + imgJobs
                 try {
                     withTimeout(18_000L) { all.awaitAll() }
@@ -222,7 +231,6 @@ class WebViewActivity : AppCompatActivity() {
                     FileLogger.e(this@WebViewActivity, "WebViewActivity", "Transform timeout after 18s: ${e.message}")
                 }
 
-                // Build JS replacer
                 val jsReplace = StringBuilder("(function(){")
                 for ((xpath, twisted) in twistedPairs) {
                     jsReplace.append("try{var n=document.evaluate('${escapeJs(xpath)}',document,null,XPathResult.FIRST_ORDERED_NODE_TYPE,null).singleNodeValue; if(n){ n.textContent = ${JSONObject.quote(twisted)}; }}catch(e){};")
@@ -232,7 +240,6 @@ class WebViewActivity : AppCompatActivity() {
                 }
                 jsReplace.append("})();")
 
-                // Inject replacement into page
                 web.evaluateJavascript(jsReplace.toString(), null)
                 cache[url] = jsReplace.toString()
                 FileLogger.d(this@WebViewActivity, "WebViewActivity", "Injected replacements (texts=${twistedPairs.size}, images=${imgPairs.size})")
@@ -241,7 +248,6 @@ class WebViewActivity : AppCompatActivity() {
             } catch (e: Exception) {
                 FileLogger.e(this@WebViewActivity, "WebViewActivity", "performTransformations error: ${e.message}")
             } finally {
-                // ensure overlay removed after a short delay
                 mainHandler.postDelayed({ hideOverlay() }, 350)
             }
         }
