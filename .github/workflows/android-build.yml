@@ -1,4 +1,4 @@
-name: Build APK (production-ready)
+name: Build APK (robust)
 
 on:
   push:
@@ -12,20 +12,13 @@ permissions:
   actions: read
   id-token: write
 
-env:
-  # Build config
-  ANDROID_PLATFORM: "android-34"
-  BUILD_TOOLS_VERSION: "34.0.0"
-  GRADLE_FALLBACK_VERSION: "8.4"
-  JAVA_TOOL_OPTIONS: "-Dfile.encoding=UTF8"
-
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 60
 
     steps:
-      - name: Checkout repository (with LFS)
+      - name: Checkout repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
@@ -47,177 +40,70 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-gradle-
 
-      - name: Ensure gradlew is executable
+      - name: Ensure gradle wrapper is executable
         run: |
           if [ -f ./gradlew ]; then
             chmod +x ./gradlew
-            echo "gradlew: present and executable"
+            echo "gradlew: present"
           else
             echo "gradlew: MISSING"
           fi
 
-      - name: Validate gradle wrapper JAR (decide whether to use wrapper)
-        id: validate_wrapper
-        run: |
-          set -euo pipefail
-          JAR="gradle/wrapper/gradle-wrapper.jar"
-          echo "Validating $JAR"
-          if [ ! -f "$JAR" ]; then
-            echo "FOUND=false" > wrapper_status.txt
-            echo "USE_WRAPPER=false" >> "$GITHUB_ENV"
-            echo "$JAR missing"
-            exit 0
-          fi
-          stat -c '%n %s bytes %U %G %a' "$JAR" || true
-          file "$JAR" || true
-          # Try listing contents and check for the GradleWrapperMain class
-          if (jar tf "$JAR" 2>/dev/null | grep -q "org/gradle/wrapper/GradleWrapperMain.class") || (unzip -l "$JAR" 2>/dev/null | grep -q "org/gradle/wrapper/GradleWrapperMain.class"); then
-            echo "FOUND=true" > wrapper_status.txt
-            echo "USE_WRAPPER=true" >> "$GITHUB_ENV"
-            echo "Wrapper appears valid and contains GradleWrapperMain"
-          else
-            echo "FOUND=false" > wrapper_status.txt
-            echo "USE_WRAPPER=false" >> "$GITHUB_ENV"
-            echo "Wrapper JAR missing GradleWrapperMain; will fall back to system gradle"
-          fi
-          echo "gradle/wrapper/gradle-wrapper.properties:"
-          sed -n '1,200p' gradle/wrapper/gradle-wrapper.properties || true
-
-      - name: Install Android command line tools and SDK components
+      - name: Install Android command line tools and SDK components (platform 34)
         run: |
           set -euo pipefail
           SDKROOT="${RUNNER_TEMP}/android-sdk"
           mkdir -p "${SDKROOT}"
-          echo "Using SDKROOT=${SDKROOT}"
-          # If sdkmanager exists, use it; otherwise download Android cmdline tools
-          if command -v sdkmanager >/dev/null 2>&1; then
-            SDKMANAGER_CMD="$(command -v sdkmanager)"
-          else
-            cd "${RUNNER_TEMP}"
-            ZIP="commandlinetools-linux.zip"
-            curl -fsSL "https://dl.google.com/android/repository/commandlinetools-linux-9477386_latest.zip" -o "$ZIP"
-            rm -rf "${SDKROOT}/cmdline-tools"
-            mkdir -p "${SDKROOT}/cmdline-tools/latest"
-            unzip -q "$ZIP" -d "${SDKROOT}/cmdline-tools/latest"
-            if [ -d "${SDKROOT}/cmdline-tools/latest/cmdline-tools" ]; then
-              mv "${SDKROOT}/cmdline-tools/latest/cmdline-tools/"* "${SDKROOT}/cmdline-tools/latest/" || true
-              rmdir "${SDKROOT}/cmdline-tools/latest/cmdline-tools" || true
-            fi
-            SDKMANAGER_CMD="${SDKROOT}/cmdline-tools/latest/bin/sdkmanager"
-            chmod +x "${SDKMANAGER_CMD}"
+          cd "${RUNNER_TEMP}"
+          ZIP="commandlinetools-linux.zip"
+          curl -fsSL "https://dl.google.com/android/repository/commandlinetools-linux-9477386_latest.zip" -o "$ZIP"
+          mkdir -p "${SDKROOT}/cmdline-tools/latest"
+          unzip -q "$ZIP" -d "${SDKROOT}/cmdline-tools/latest"
+          if [ -d "${SDKROOT}/cmdline-tools/latest/cmdline-tools" ]; then
+            mv "${SDKROOT}/cmdline-tools/latest/cmdline-tools/"* "${SDKROOT}/cmdline-tools/latest/" || true
+            rmdir "${SDKROOT}/cmdline-tools/latest/cmdline-tools" || true
           fi
-
-          # Accept licenses and install minimal platforms & build-tools
-          yes | "${SDKMANAGER_CMD}" --sdk_root="${SDKROOT}" "platform-tools" "platforms;${ANDROID_PLATFORM}" "build-tools;${BUILD_TOOLS_VERSION}" "cmdline-tools;latest" || true
+          SDKMANAGER_CMD="${SDKROOT}/cmdline-tools/latest/bin/sdkmanager"
+          chmod +x "${SDKMANAGER_CMD}"
+          yes | "${SDKMANAGER_CMD}" --sdk_root="${SDKROOT}" "platform-tools" "platforms;android-34" "build-tools;34.0.0" "cmdline-tools;latest" || true
           yes | "${SDKMANAGER_CMD}" --sdk_root="${SDKROOT}" --licenses || true
-
           echo "ANDROID_SDK_ROOT=${SDKROOT}" >> "${GITHUB_ENV}"
           echo "${SDKROOT}/platform-tools" >> "${GITHUB_PATH}"
-          echo "${SDKROOT}/build-tools/${BUILD_TOOLS_VERSION}" >> "${GITHUB_PATH}"
+          echo "${SDKROOT}/build-tools/34.0.0" >> "${GITHUB_PATH}"
           echo "Android SDK components installed to ${SDKROOT}"
 
-      - name: Print diagnostics
+      - name: Print Java & Gradle versions (for logs)
         run: |
-          echo "USE_WRAPPER=${USE_WRAPPER:-false}"
           java -version || true
-          echo "gradlew present?"; [ -f ./gradlew ] && echo "yes" || echo "no"
-          echo "--- gradle/wrapper dir ---"; ls -la gradle/wrapper || true
-          echo "gradle-wrapper properties:"; sed -n '1,80p' gradle/wrapper/gradle-wrapper.properties || true
+          if [ -f ./gradlew ]; then ./gradlew --version || true; fi
 
-      - name: Build APKs (wrapper preferred, fallback to system Gradle 8.4)
-        env:
-          JAVA_TOOL_OPTIONS: "${{ env.JAVA_TOOL_OPTIONS }}"
+      - name: Build APKs (debug + release)
         run: |
           set -euo pipefail
-          echo "USE_WRAPPER=${USE_WRAPPER:-false}"
-          if [ "${USE_WRAPPER:-false}" = "true" ] && [ -f ./gradlew ]; then
-            echo "Using gradle wrapper: ./gradlew assembleDebug assembleRelease"
-            chmod +x ./gradlew
-            ./gradlew --no-daemon assembleDebug assembleRelease --stacktrace
+          if [ -f ./gradlew ]; then
+            echo "Using gradlew wrapper"
+            ./gradlew assembleDebug assembleRelease --stacktrace --no-daemon
           else
-            echo "Gradle wrapper unusable — installing Gradle ${GRADLE_FALLBACK_VERSION} via SDKMAN and using system gradle"
+            echo "gradlew missing, installing Gradle 8.4 and trying system gradle"
             curl -s "https://get.sdkman.io" | bash
-            source "$HOME/.sdkman/bin/sdkman-init.sh" || true
-            if command -v sdk >/dev/null 2>&1; then
-              sdk install gradle ${GRADLE_FALLBACK_VERSION} || true
-            else
-              echo "sdkman not available in this shell; attempting apt-get gradle (may be older)"
-              sudo apt-get update -y
-              sudo apt-get install -y gradle
-            fi
-            gradle --version || true
-            gradle assembleDebug assembleRelease --no-daemon --stacktrace
+            source "$HOME/.sdkman/bin/sdkman-init.sh"
+            sdk install gradle 8.4
+            gradle assembleDebug assembleRelease --stacktrace --no-daemon
           fi
+        env:
+          JAVA_TOOL_OPTIONS: "-Dfile.encoding=UTF8"
 
-      - name: Locate APKs (list outputs)
+      - name: Show APK outputs
         run: |
-          echo "Listing possible APK outputs:"
-          find app/build/outputs -type f -maxdepth 3 -name "*.apk" -print || true
+          echo "Debug APK:"
           ls -la app/build/outputs/apk/debug || true
+          echo "Release APK:"
           ls -la app/build/outputs/apk/release || true
 
-      - name: Sign & zipalign release APK if keystore provided
-        if: ${{ secrets.ANDROID_KEYSTORE_BASE64 != '' }}
-        env:
-          ANDROID_SDK_ROOT: "${{ env.ANDROID_SDK_ROOT }}"
-          BUILD_TOOLS_VERSION: "${{ env.BUILD_TOOLS_VERSION }}"
-          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
-          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
-          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
-        run: |
-          set -euo pipefail
-          # Find the unsigned release APK (common names)
-          UNSIGNED_APK=$(ls -1 app/build/outputs/apk/release/*-unsigned*.apk 2>/dev/null || true)
-          if [ -z "$UNSIGNED_APK" ]; then
-            # fallback to any release apk
-            UNSIGNED_APK=$(ls -1 app/build/outputs/apk/release/*.apk 2>/dev/null | head -n1 || true)
-          fi
-          if [ -z "$UNSIGNED_APK" ]; then
-            echo "No release APK found to sign."
-            exit 1
-          fi
-          echo "Unsigned release APK: $UNSIGNED_APK"
-
-          # Create keystore from base64 secret
-          echo "Restoring keystore from secret"
-          echo "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" | base64 -d > release.keystore
-          chmod 600 release.keystore
-
-          ZIPALIGN="${ANDROID_SDK_ROOT}/build-tools/${BUILD_TOOLS_VERSION}/zipalign"
-          APKSIGNER="${ANDROID_SDK_ROOT}/build-tools/${BUILD_TOOLS_VERSION}/apksigner"
-
-          if [ ! -x "$ZIPALIGN" ]; then
-            echo "zipalign not found at $ZIPALIGN; listing build-tools dir"
-            ls -la "${ANDROID_SDK_ROOT}/build-tools/" || true
-            exit 1
-          fi
-          if [ ! -x "$APKSIGNER" ]; then
-            echo "apksigner not found at $APKSIGNER"
-            ls -la "${ANDROID_SDK_ROOT}/build-tools/${BUILD_TOOLS_VERSION}" || true
-            exit 1
-          fi
-
-          ALIGNED_APK="app-release-aligned.apk"
-          SIGNED_APK="app-release-signed.apk"
-
-          echo "Zipaligning..."
-          "$ZIPALIGN" -v -p 4 "$UNSIGNED_APK" "$ALIGNED_APK"
-
-          echo "Signing with apksigner..."
-          "$APKSIGNER" sign --ks release.keystore --ks-pass pass:"${KEYSTORE_PASSWORD}" --key-pass pass:"${KEY_PASSWORD}" --out "$SIGNED_APK" "$ALIGNED_APK"
-
-          echo "Verifying signed APK..."
-          "$APKSIGNER" verify --print-certs "$SIGNED_APK" || true
-
-          echo "Signed APK ready: $SIGNED_APK"
-          ls -la "$SIGNED_APK" || true
-
-      - name: Upload artifacts (debug APK, unsigned release APK, signed release APK if present)
+      - name: Upload APK artifacts
         uses: actions/upload-artifact@v4
         with:
           name: twisted-apks
           path: |
-            app/build/outputs/apk/debug/app-debug.apk
-            app/build/outputs/apk/release/app-release-unsigned.apk
-            app-release-signed.apk
-
+            app/build/outputs/apk/debug/*.apk
+            app/build/outputs/apk/release/*.apk
