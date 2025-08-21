@@ -40,7 +40,7 @@ class TwistedApp : Application() {
             securePrefs = getSharedPreferences("secure_prefs", Context.MODE_PRIVATE)
         }
 
-        // Schedule ALT message system initial work (no-arg call — your scheduler expects zero arguments)
+        // Schedule ALT mssage system initial work (no-arg call — your scheduler expects zero arguments)
         try {
             AltMessageScheduler.scheduleInitial()
         } catch (t: Throwable) {
