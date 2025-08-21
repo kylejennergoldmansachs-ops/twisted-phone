@@ -4,125 +4,126 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
+import android.content.ContentResolver
 import android.content.Context
 import android.content.Intent
+import android.database.Cursor
 import android.graphics.Bitmap
-import android.location.Location
+import android.graphics.BitmapFactory
+import android.net.Uri
 import android.os.IBinder
 import android.provider.MediaStore
 import android.util.Base64
-import androidx.camera.core.CameraSelector
-import androidx.camera.core.ImageCapture
-import androidx.camera.core.ImageCaptureException
-import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.core.app.NotificationCompat
-import androidx.core.content.ContextCompat
 import com.google.android.gms.location.LocationServices
 import com.google.android.gms.tasks.Tasks
 import com.twistedphone.TwistedApp
 import com.twistedphone.ai.MistralClient
 import com.twistedphone.messages.MessageStore
+import com.twistedphone.util.Logger
 import kotlinx.coroutines.*
-import java.io.File
-import java.util.*
-import java.util.concurrent.TimeUnit
+import java.io.ByteArrayOutputStream
 
 class AltMessageService : Service() {
-    private val scope = CoroutineScope(Dispatchers.IO + Job())
-    private val prefs = TwistedApp.instance.securePrefs
-    private val settings = TwistedApp.instance.settingsPrefs
+    private val TAG = "AltMessageService"
+    private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+
     override fun onBind(intent: Intent?): IBinder? = null
-    
+
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        val isReply = intent?.getBooleanExtra("is_reply", false) ?: false
-        val installTime = prefs.getLong("install_time", 0)
-        val now = System.currentTimeMillis()
-        val rng = Random()
-        val chance = if (isReply) 1.0 else if (now - installTime > 24L * 60 * 60 * 1000) 0.4 else 0.7
-        if (rng.nextDouble() > chance) { stopSelf(); return START_NOT_STICKY }
-        
         scope.launch {
-            var msg = ""
-            if (now - installTime < 24L * 60 * 60 * 1000 && rng.nextDouble() < 0.5) {
-                msg = generateGibberish()
-            } else {
-                val history = MessageStore.recentHistory(applicationContext)
-                var contextHint = "Time: $now"
-                
-                try {
-                    val locProvider = LocationServices.getFusedLocationProviderClient(applicationContext)
-                    val loc = try {
-                        Tasks.await(locProvider.lastLocation, 2, TimeUnit.SECONDS)
-                    } catch (e: Exception) { null }
-                    if (loc != null) contextHint += " Location: ${loc.latitude},${loc.longitude}"
-                } catch (_: Exception) {}
-                
-                if (settings.getBoolean("camera_context", false)) {
-                    val thumbnail = captureThumbnail()
-                    if (thumbnail != null) {
-                        val client = MistralClient()
-                        val desc = client.getImageDescription(thumbnail)
-                        if (desc.isNotBlank()) contextHint += " Scene: $desc"
+            handleWork()
+        }
+        return START_STICKY
+    }
+
+    private suspend fun handleWork() {
+        val prefs = TwistedApp.instance.settingsPrefs
+        val settings = prefs
+        val includeCameraContext = settings.getBoolean("camera_context", false)
+        val includeLocation = settings.getBoolean("include_location", false)
+
+        var thumbnailDataUri: String? = null
+        if (includeCameraContext) {
+            try {
+                thumbnailDataUri = getMostRecentImageAsDataUri()
+            } catch (e: Exception) {
+                Logger.e(TAG, "thumbnail extraction failed: ${e.message}")
+            }
+        }
+
+        var locationStr: String? = null
+        if (includeLocation) {
+            try {
+                val fused = LocationServices.getFusedLocationProviderClient(this@AltMessageService)
+                val loc = Tasks.await(fused.lastLocation)
+                if (loc != null) locationStr = "${loc.latitude},${loc.longitude}"
+            } catch (e: Exception) {
+                Logger.e(TAG, "location fetch failed: ${e.message}")
+            }
+        }
+
+        val promptHint = prefs.getString("prompt_hint", "something odd") ?: "something odd"
+        val client = MistralClient
+        val desc = thumbnailDataUri?.let { client.getImageDescription(it) }
+        val history = MessageStore.getRecentMessages(this@AltMessageService, 6)
+        val contextHint = buildString {
+            append(promptHint)
+            if (!desc.isNullOrBlank()) append(" Image description: $desc")
+            if (!locationStr.isNullOrBlank()) append(" Location: $locationStr")
+        }
+
+        val generated = client.generateAltMessage(contextHint, history)
+        val text = generated ?: "..."
+
+        showNotification(text)
+        MessageStore.insertIncoming(this@AltMessageService, text, System.currentTimeMillis())
+    }
+
+    private fun getMostRecentImageAsDataUri(): String? {
+        // Query MediaStore for the most recent image (may be camera or screenshot).
+        val resolver: ContentResolver = contentResolver
+        val uriExternal: Uri = MediaStore.Images.Media.EXTERNAL_CONTENT_URI
+        val projection = arrayOf(MediaStore.Images.Media._ID, MediaStore.Images.Media.DATE_ADDED)
+        val sort = "${MediaStore.Images.Media.DATE_ADDED} DESC"
+        var cursor: Cursor? = null
+        try {
+            cursor = resolver.query(uriExternal, projection, null, null, sort)
+            if (cursor != null && cursor.moveToFirst()) {
+                val idIndex = cursor.getColumnIndexOrThrow(MediaStore.Images.Media._ID)
+                val id = cursor.getLong(idIndex)
+                val uri = Uri.withAppendedPath(uriExternal, id.toString())
+                resolver.openInputStream(uri).use { input ->
+                    if (input != null) {
+                        val bmp = BitmapFactory.decodeStream(input) ?: return null
+                        val thumb = Bitmap.createScaledBitmap(bmp, 256, (256f * bmp.height / bmp.width).toInt(), true)
+                        val baos = ByteArrayOutputStream()
+                        thumb.compress(Bitmap.CompressFormat.JPEG, 70, baos)
+                        val bytes = baos.toByteArray()
+                        val b64 = Base64.encodeToString(bytes, Base64.NO_WRAP)
+                        return "data:image/jpeg;base64,$b64"
                     }
                 }
-                
-                val client = MistralClient()
-                msg = client.generateAltMessage(contextHint, history)
             }
-            
-            if (msg.isNotBlank()) {
-                MessageStore.addMessage(applicationContext, "ALT", msg)
-                showNotification(msg)
-            }
-            stopSelf()
+        } catch (e: Exception) {
+            Logger.e(TAG, "getMostRecentImageAsDataUri failed: ${e.message}")
+        } finally {
+            cursor?.close()
         }
-        return START_NOT_STICKY
+        return null
     }
-    
-    private fun generateGibberish(): String {
-        val chars = "abcdefghijklmnopqrstuvwxyz1234567890!@#$%^&*()".toCharArray()
-        return (1..20).map { chars.random() }.joinToString("")
-    }
-    
-    private suspend fun captureThumbnail(): String? = withContext(Dispatchers.IO) {
-    try {
-        // Start the camera capture activity
-        val intent = Intent(applicationContext, CameraCaptureActivity::class.java)
-        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-        applicationContext.startActivity(intent)
-        
-        // Wait for the result using a broadcast receiver
-        val latch = java.util.concurrent.CountDownLatch(1)
-        var result: String? = null
-        
-        val receiver = object : android.content.BroadcastReceiver() {
-            override fun onReceive(context: Context, intent: Intent) {
-                result = intent.getStringExtra("thumbnail")
-                latch.countDown()
-            }
-        }
-        
-        applicationContext.registerReceiver(receiver, 
-            android.content.IntentFilter("CAMERA_CAPTURE_RESULT"))
-        
-        // Wait for result with timeout
-        latch.await(10, TimeUnit.SECONDS)
-        applicationContext.unregisterReceiver(receiver)
-        
-        result
-    } catch (e: Exception) {
-        e.printStackTrace()
-        null
-    }
-}
-    
+
     private fun showNotification(text: String) {
+        val chId = "alt_messages"
         val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-        val chId = "altch"
-        val ch = NotificationChannel(chId, "Alternative Self", NotificationManager.IMPORTANCE_HIGH)
-        nm.createNotificationChannel(ch)
-        val intent = Intent(this, com.twistedphone.messages.MessagesActivity::class.java)
-        val pi = PendingIntent.getActivity(this, 0, intent, PendingIntent.FLAG_IMMUTABLE)
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
+            val ch = NotificationChannel(chId, "Alt messages", NotificationManager.IMPORTANCE_DEFAULT)
+            nm.createNotificationChannel(ch)
+        }
+        val intent = Intent(this, javaClass)
+        val piFlags = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.M)
+            PendingIntent.FLAG_IMMUTABLE or 0 else 0
+        val pi = PendingIntent.getActivity(this, 0, intent, piFlags)
         val n = NotificationCompat.Builder(this, chId)
             .setContentTitle("Message from someone...")
             .setContentText(text)
@@ -131,9 +132,9 @@ class AltMessageService : Service() {
             .build()
         nm.notify((System.currentTimeMillis() % 10000).toInt(), n)
     }
-    
-    override fun onDestroy() { 
-        super.onDestroy() 
-        scope.cancel() 
+
+    override fun onDestroy() {
+        super.onDestroy()
+        scope.cancel()
     }
 }
