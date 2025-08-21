@@ -9,9 +9,8 @@ jobs:
   build:
     runs-on: ubuntu-latest
     env:
-      # default gradle command (fall back to ./gradlew)
-      GRADLE_CMD: ./gradlew
-      ANDROID_SDK_ROOT: ${{ runner.temp }}/android-sdk
+      # keep GRADLE_CMD simple and consistent
+      GRADLE_CMD: "./gradlew"
 
     steps:
       - name: Checkout repository
@@ -43,8 +42,12 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          SDKROOT="${ANDROID_SDK_ROOT}"
+
+          # Use the runner-provided temporary directory
+          SDKROOT="${RUNNER_TEMP}/android-sdk"
           mkdir -p "${SDKROOT}"
+
+          echo "Using SDKROOT=${SDKROOT}"
 
           # Look for an existing sdkmanager first
           if command -v sdkmanager >/dev/null 2>&1; then
@@ -56,14 +59,12 @@ jobs:
             SDKMANAGER_CMD="${SDKROOT}/cmdline-tools/bin/sdkmanager"
           else
             echo "No sdkmanager found — downloading Android commandline tools"
-            cd "${RUNNER_TEMP:-/tmp}"
+            cd "${RUNNER_TEMP}"
             ZIP="commandlinetools-linux.zip"
-            # Download a reasonably recent command-line tools distribution
             curl -fsSL "https://dl.google.com/android/repository/commandlinetools-linux-9477386_latest.zip" -o "$ZIP"
             mkdir -p "${SDKROOT}/cmdline-tools/latest"
             unzip -q "$ZIP" -d "${SDKROOT}/cmdline-tools/latest"
-            # The downloaded zip commonly contains a top-level 'cmdline-tools' folder;
-            # move its contents into .../cmdline-tools/latest
+            # Move nested contents if present
             if [ -d "${SDKROOT}/cmdline-tools/latest/cmdline-tools" ]; then
               mv "${SDKROOT}/cmdline-tools/latest/cmdline-tools"/* "${SDKROOT}/cmdline-tools/latest/" || true
               rmdir "${SDKROOT}/cmdline-tools/latest/cmdline-tools" || true
@@ -73,13 +74,18 @@ jobs:
           fi
 
           echo "sdkmanager => ${SDKMANAGER_CMD}"
-          export PATH="${SDKROOT}/platform-tools:${PATH}"
 
-          # Accept licenses and install required components for compileSdk 34
+          # Ensure platform-tools, platforms and build-tools for compileSdk 34 are installed
           "${SDKMANAGER_CMD}" --sdk_root="${SDKROOT}" "platform-tools" "platforms;android-34" "build-tools;34.0.0" "cmdline-tools;latest" || true
 
-          # Accept all licenses non-interactively
+          # Accept licenses non-interactively
           yes | "${SDKMANAGER_CMD}" --sdk_root="${SDKROOT}" --licenses || true
+
+          # Make SDKROOT available to following steps
+          echo "ANDROID_SDK_ROOT=${SDKROOT}" >> "${GITHUB_ENV}"
+
+          # Add platform-tools to PATH for remaining steps
+          echo "${SDKROOT}/platform-tools" >> "${GITHUB_PATH}"
 
           echo "Installed Android SDK components under ${SDKROOT}"
       - name: Show gradle command
@@ -88,13 +94,13 @@ jobs:
       - name: Build debug APK (assembleDebug)
         run: |
           set -euo pipefail
-          # Ensure gradle wrapper is used if present
           if [ -f ./gradlew ]; then
             ./gradlew --version
           fi
           $GRADLE_CMD assembleDebug --no-daemon
         env:
           JAVA_TOOL_OPTIONS: "-Dfile.encoding=UTF8"
+          # ANDROID_SDK_ROOT is set in the previous step and persisted via GITHUB_ENV
           ANDROID_SDK_ROOT: ${{ env.ANDROID_SDK_ROOT }}
 
       - name: Upload APK artifact
