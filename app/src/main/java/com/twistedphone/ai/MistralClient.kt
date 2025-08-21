@@ -21,7 +21,7 @@ object MistralClient {
     private const val TAG = "MistralClient"
     // Keep the default base URL; if your environment requires a different endpoint,
     // store it in prefs or change here.
-    private const val BASE_URL = "https://api.mistral.ai/v1/agents.completions"
+    private const val BASE_URL = "https://api.mistral.ai/v1/agents/completions"
 
     /**
      * Top-level helper with randomized backoff and retries.
