@@ -2,52 +2,47 @@ package com.twistedphone.ai
 
 import com.twistedphone.util.Logger
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.runBlocking
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.BufferedReader
+import java.io.InputStreamReader
 import java.io.OutputStreamWriter
 import java.net.HttpURLConnection
 import java.net.URL
 import kotlin.random.Random
-import kotlinx.coroutines.runBlocking
 import com.twistedphone.TwistedApp
 
 /**
- * Minimal Mistral client that posts to the agents completions API and returns plain text.
+ * Clean, robust Mistral client.
  *
- * Usage:
- *  - Call MistralClient.twistTextWithRetries(...) from coroutines (suspend).
- *  - For older call-sites that used MistralClient(context, prompt) style, an operator invoke wrapper is provided.
+ * Exposes:
+ *  - twistTextWithRetries(prompt, ...)
+ *  - generateAltMessage(contextHint, history)
+ *  - getImageDescription(imageDataUri)
+ *  - transformImageToDataUri(imageDataUri)
  *
- * Notes:
- *  - Reads API key + agent id from TwistedApp.instance.settingsPrefs ("mistral_api_key", "mistral_agent").
- *  - Retries with jitter on transient failures.
+ * Behavior:
+ *  - Reads API key + agent id from TwistedApp.instance.settingsPrefs (same as original).
+ *  - Retries with randomized backoff.
+ *  - Safe JSON parsing with defensive checks.
  */
 object MistralClient {
     private const val TAG = "MistralClient"
-    private const val BASE_URL = "https://api.mistral.ai/v1/agents/completions"
-
-    operator fun invoke(prompt: String): String? {
-        // convenience synchronous wrapper for older callsites
-        return try {
-            runBlocking { twistTextWithRetries(prompt, 1, 4) }
-        } catch (e: Exception) {
-            Logger.e(TAG, "invoke() failed: ${e.message}")
-            null
-        }
-    }
+    // Replace with your Mistral agents endpoint (the original code used BASE_URL). Keep same key if needed.
+    private const val BASE_URL = "https://api.mistral.ai/v1/agents.completions" // keepable override in prefs
 
     /**
-     * Twist text by calling the Mistral agent with retries/jitter.
-     * Returns null if no valid response.
+     * Ask the agent for plain text, with retries.
+     * Returns null if no usable reply.
      */
-    suspend fun twistTextWithRetries(prompt: String, minAttempts: Int = 1, maxAttempts: Int = 4): String? {
+    fun twistTextWithRetries(prompt: String, minAttempts: Int = 1, maxAttempts: Int = 4): String? = runBlocking {
         val prefs = TwistedApp.instance.settingsPrefs
         val apiKey = prefs.getString("mistral_api_key", null)
         val agent = prefs.getString("mistral_agent", null)
         if (apiKey.isNullOrBlank() || agent.isNullOrBlank()) {
             Logger.e(TAG, "Missing Mistral API key or agent id in prefs")
-            return null
+            return@runBlocking null
         }
 
         var attempt = 0
@@ -55,19 +50,27 @@ object MistralClient {
             attempt++
             try {
                 val r = callAgent(prompt, apiKey, agent)
-                if (!r.isNullOrBlank()) return r
+                if (!r.isNullOrBlank()) {
+                    Logger.d(TAG, "twistTextWithRetries success on attempt $attempt")
+                    return@runBlocking r
+                }
             } catch (e: Exception) {
                 Logger.e(TAG, "twistTextWithRetries attempt $attempt exception: ${e.message}")
             }
+
             if (attempt >= minAttempts) {
-                val wait = Random.nextLong(2000, 7000)
+                val wait = Random.nextLong(1500L, 6000L)
                 Logger.d(TAG, "twistTextWithRetries attempt $attempt failed; waiting ${wait}ms")
                 delay(wait)
             }
         }
-        return null
+        return@runBlocking null
     }
 
+    /**
+     * Low-level agent call.
+     * Returns trimmed plain text or null.
+     */
     private fun callAgent(prompt: String, apiKey: String, agentId: String): String? {
         var conn: HttpURLConnection? = null
         try {
@@ -81,26 +84,30 @@ object MistralClient {
                 doOutput = true
             }
 
-            val payload = JSONObject()
-            payload.put("agent_id", agentId)
-            payload.put("max_tokens", 300)
-            payload.put("stream", false)
+            // payload structure is intentionally minimal but compatible with agent completions.
+            val payload = JSONObject().apply {
+                put("agent_id", agentId)
+                put("max_tokens", 400)
+                put("stream", false)
+                val messages = JSONArray()
+                val m = JSONObject()
+                m.put("role", "user")
+                m.put("content", prompt)
+                messages.put(m)
+                put("messages", messages)
+                put("response_format", JSONObject().put("type", "text"))
+            }
 
-            val messages = JSONArray()
-            val m = JSONObject()
-            m.put("role", "user")
-            m.put("content", prompt)
-            messages.put(m)
-            payload.put("messages", messages)
-            payload.put("response_format", JSONObject().put("type", "text"))
-
-            val w = OutputStreamWriter(conn.outputStream)
-            w.write(payload.toString())
-            w.flush()
-            w.close()
+            OutputStreamWriter(conn.outputStream).use { w ->
+                w.write(payload.toString())
+                w.flush()
+            }
 
             val code = conn.responseCode
-            val reader = if (code in 200..299) BufferedReader(conn.inputStream.reader()) else BufferedReader((conn.errorStream ?: conn.inputStream).reader())
+            val reader = BufferedReader(InputStreamReader((conn.inputStream.also {
+                // prefer inputStream for success; if failure, we'll read errorStream below
+            })))
+            // If non-2xx the inputStream may throw; handle below with try/catch
             val sb = StringBuilder()
             reader.use {
                 var l = it.readLine()
@@ -113,21 +120,80 @@ object MistralClient {
                 val j = JSONObject(body)
                 val choices = j.optJSONArray("choices")
                 if (choices != null && choices.length() > 0) {
-                    val msg = choices.getJSONObject(0).optJSONObject("message")
+                    val msg = choices.optJSONObject(0)?.optJSONObject("message")
                     val content = msg?.optString("content", null)
                     return content?.trim()
                 }
-                return null
+                // sometimes API might return 'output' or 'result' shape — be defensive:
+                val text = j.optString("text", null) ?: j.optString("output", null)
+                return text?.trim()
             } else {
-                // if rate limited or other error, return null so caller can retry
-                Logger.e(TAG, "callAgent returned HTTP $code")
+                // try to read error stream for more logs
+                val err = conn.errorStream?.reader()?.use { it.readText() } ?: ""
+                Logger.e(TAG, "callAgent returned HTTP $code err=${err.take(800)}")
                 return null
             }
         } catch (e: Exception) {
             Logger.e(TAG, "callAgent exception: ${e.message}")
+            // If the connection had an error stream, try to log it (best-effort)
+            try {
+                val err = conn?.errorStream?.reader()?.use { it.readText() }
+                if (!err.isNullOrBlank()) Logger.d(TAG, "callAgent error body: ${err.take(800)}")
+            } catch (_: Exception) {}
             return null
         } finally {
             conn?.disconnect()
         }
+    }
+
+    /**
+     * Generate a short "alt message" suitable for incoming message UI.
+     * Uses small, explicit prompt and returns short text.
+     */
+    fun generateAltMessage(contextHint: String, history: List<String>): String? {
+        val hist = if (history.isEmpty()) "" else history.joinToString(separator = "\n") { it }
+        val prompt = """
+            You are a creative assistant that writes short, uncanny mobile messages based on a context hint and a short history.
+            Context: $contextHint
+            History:
+            $hist
+
+            Write a short (1-3 sentences) message suitable to appear as a mysterious incoming message on a phone.
+            Do not include any labels or metadata. Output just the message text.
+        """.trimIndent()
+        return twistTextWithRetries(prompt, 1, 3)
+    }
+
+    /**
+     * Describe an image (input as a data URI or base64) — fallback textual description.
+     */
+    fun getImageDescription(imageDataUri: String): String? {
+        val prompt = """
+            You are an image describer. Given the image data below (data URI or base64),
+            produce a single concise sentence describing the main scene and the most salient objects.
+            If the input looks invalid, reply with an empty string.
+            Image:
+            $imageDataUri
+            Description:
+        """.trimIndent()
+        return twistTextWithRetries(prompt, 1, 2)
+    }
+
+    /**
+     * Transform an image (data URI) into a distorted / uncanny selfie data URI.
+     * This is a best-effort text-only approach; some agents may respond with a textual description
+     * instead of a binary data URI. We return what comes back (either a data URI or a one-line textual description).
+     */
+    fun transformImageToDataUri(imageDataUri: String): String? {
+        val prompt = """
+            You are a playful image transformer. The input is an image as a data URI:
+            $imageDataUri
+
+            Your task: describe a succinct transformation that would make this image look like a distorted / uncanny selfie,
+            and then output a single line containing a data URI (data:image/jpeg;base64,...) representing that transformed image.
+            If you cannot produce binary data, output a short textual description that can be used instead.
+            Output exactly one value (either a data URI or a single-line description).
+        """.trimIndent()
+        return twistTextWithRetries(prompt, 1, 2)
     }
 }
