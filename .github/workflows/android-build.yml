@@ -1,20 +1,53 @@
-name: Build APK
+name: Build APK (diagnostic)
 
 on:
   push:
     branches: [ main, master ]
   pull_request:
+  workflow_dispatch:
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    env:
-      # keep GRADLE_CMD simple and consistent
-      GRADLE_CMD: "./gradlew"
+    # Prevent long stuck jobs; adjust as needed
+    timeout-minutes: 30
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Early debug — show runner info, date, and PATH
+        run: |
+          echo "=== START DEBUG DUMP ==="
+          echo "Date: $(date -u)"
+          echo "Runner OS: $RUNNER_OS"
+          echo "Runner Temp: $RUNNER_TEMP"
+          echo "Workspace: $GITHUB_WORKSPACE"
+          echo "Actor: $GITHUB_ACTOR"
+          echo "Event name: $GITHUB_EVENT_NAME"
+          echo "Repo: $GITHUB_REPOSITORY"
+          echo "Branch (git): $(git rev-parse --abbrev-ref HEAD || echo 'no-git')"
+          echo "-------------------------"
+          echo "PATH:"
+          echo "$PATH"
+          echo "-------------------------"
+          echo "Environment variables (filtered):"
+          env | sed -n '1,200p'
+          echo "=== END DEBUG DUMP ==="
+
+      - name: List repo root + workflow file content
+        run: |
+          echo "PWD: $(pwd)"
+          echo "Listing repo root:"
+          ls -la
+          echo "Listing .github/workflows:"
+          ls -la .github/workflows || true
+          echo "Show the workflow file:"
+          echo "---- BEGIN WORKFLOW ----"
+          sed -n '1,200p' .github/workflows/android-build.yml || true
+          echo "---- END WORKFLOW ----"
 
       - name: Setup JDK 17
         uses: actions/setup-java@v4
@@ -24,87 +57,14 @@ jobs:
 
       - name: Ensure gradle wrapper is executable
         run: |
-          if [ -f ./gradlew ]; then
-            chmod +x ./gradlew
-          fi
+          if [ -f ./gradlew ]; then chmod +x ./gradlew; fi
+          echo "gradlew exists? $(test -f ./gradlew && echo yes || echo no)"
 
-      - name: Cache Gradle packages
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.gradle/caches
-            ~/.gradle/wrapper
-          key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
-          restore-keys: |
-            ${{ runner.os }}-gradle-
-
-      - name: Ensure Android SDK + build tools are installed (if necessary)
-        shell: bash
+      - name: Print java and gradle versions
         run: |
-          set -euo pipefail
+          java -version || true
+          if [ -f ./gradlew ]; then ./gradlew --version || true; fi
 
-          # Use the runner-provided temporary directory
-          SDKROOT="${RUNNER_TEMP}/android-sdk"
-          mkdir -p "${SDKROOT}"
-
-          echo "Using SDKROOT=${SDKROOT}"
-
-          # Look for an existing sdkmanager first
-          if command -v sdkmanager >/dev/null 2>&1; then
-            echo "Using preinstalled sdkmanager from PATH"
-            SDKMANAGER_CMD="$(command -v sdkmanager)"
-          elif [ -x "${SDKROOT}/cmdline-tools/latest/bin/sdkmanager" ]; then
-            SDKMANAGER_CMD="${SDKROOT}/cmdline-tools/latest/bin/sdkmanager"
-          elif [ -x "${SDKROOT}/cmdline-tools/bin/sdkmanager" ]; then
-            SDKMANAGER_CMD="${SDKROOT}/cmdline-tools/bin/sdkmanager"
-          else
-            echo "No sdkmanager found — downloading Android commandline tools"
-            cd "${RUNNER_TEMP}"
-            ZIP="commandlinetools-linux.zip"
-            curl -fsSL "https://dl.google.com/android/repository/commandlinetools-linux-9477386_latest.zip" -o "$ZIP"
-            mkdir -p "${SDKROOT}/cmdline-tools/latest"
-            unzip -q "$ZIP" -d "${SDKROOT}/cmdline-tools/latest"
-            # Move nested contents if present
-            if [ -d "${SDKROOT}/cmdline-tools/latest/cmdline-tools" ]; then
-              mv "${SDKROOT}/cmdline-tools/latest/cmdline-tools"/* "${SDKROOT}/cmdline-tools/latest/" || true
-              rmdir "${SDKROOT}/cmdline-tools/latest/cmdline-tools" || true
-            fi
-            SDKMANAGER_CMD="${SDKROOT}/cmdline-tools/latest/bin/sdkmanager"
-            chmod +x "${SDKMANAGER_CMD}"
-          fi
-
-          echo "sdkmanager => ${SDKMANAGER_CMD}"
-
-          # Ensure platform-tools, platforms and build-tools for compileSdk 34 are installed
-          "${SDKMANAGER_CMD}" --sdk_root="${SDKROOT}" "platform-tools" "platforms;android-34" "build-tools;34.0.0" "cmdline-tools;latest" || true
-
-          # Accept licenses non-interactively
-          yes | "${SDKMANAGER_CMD}" --sdk_root="${SDKROOT}" --licenses || true
-
-          # Make SDKROOT available to following steps
-          echo "ANDROID_SDK_ROOT=${SDKROOT}" >> "${GITHUB_ENV}"
-
-          # Add platform-tools to PATH for remaining steps
-          echo "${SDKROOT}/platform-tools" >> "${GITHUB_PATH}"
-
-          echo "Installed Android SDK components under ${SDKROOT}"
-      - name: Show gradle command
-        run: echo "Running build with -> $GRADLE_CMD"
-
-      - name: Build debug APK (assembleDebug)
+      - name: Quick fail-safe step to confirm logs appear
         run: |
-          set -euo pipefail
-          if [ -f ./gradlew ]; then
-            ./gradlew --version
-          fi
-          $GRADLE_CMD assembleDebug --no-daemon
-        env:
-          JAVA_TOOL_OPTIONS: "-Dfile.encoding=UTF8"
-          # ANDROID_SDK_ROOT is set in the previous step and persisted via GITHUB_ENV
-          ANDROID_SDK_ROOT: ${{ env.ANDROID_SDK_ROOT }}
-
-      - name: Upload APK artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: twisted-apk
-          path: app/build/outputs/apk/debug/app-debug.apk
+          echo "This step finishes successfully. If you see this in logs, the workflow is running."
