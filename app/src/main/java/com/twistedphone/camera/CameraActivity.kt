@@ -20,11 +20,16 @@ import com.twistedphone.TwistedApp
 import com.twistedphone.util.FileLogger
 import org.tensorflow.lite.Interpreter
 import org.tensorflow.lite.gpu.GpuDelegate
+import org.tensorflow.lite.gpu.CompatibilityList
 import org.tensorflow.lite.support.common.FileUtil
 import org.tensorflow.lite.support.image.TensorImage
 import org.tensorflow.lite.support.tensorbuffer.TensorBuffer
 import org.tensorflow.lite.task.vision.detector.ObjectDetector
+import org.tensorflow.lite.task.core.BaseOptions
 import java.io.File
+import java.io.IOException
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
 import java.nio.FloatBuffer
 import javax.microedition.khronos.egl.EGLConfig
 import javax.microedition.khronos.opengles.GL10
@@ -34,12 +39,22 @@ import kotlin.math.sin
 class CameraActivity : AppCompatActivity() {
     private lateinit var previewView: PreviewView
     private lateinit var glSurfaceView: GLSurfaceView
+
     private val prefs = TwistedApp.instance.settingsPrefs
+
     private var cameraSelector = CameraSelector.DEFAULT_BACK_CAMERA
+
+    // MiDaS interpreter + GPU delegate (if used)
     private var midasInterpreter: Interpreter? = null
+    private var gpuDelegate: GpuDelegate? = null
+
+    // Pose detector (TFLite Task Vision)
     private var poseDetector: ObjectDetector? = null
+
     private var useEnhanced = false
     private var aggressiveness = 1
+
+    // last depth/pose results (best-effort)
     private var depthMap: TensorBuffer? = null
 
     override fun onCreate(s: Bundle?) {
@@ -47,15 +62,17 @@ class CameraActivity : AppCompatActivity() {
         setContentView(R.layout.activity_camera)
         previewView = findViewById(R.id.previewView)
         glSurfaceView = findViewById(R.id.glSurfaceView)
+
         useEnhanced = prefs.getBoolean("enhanced_camera", false)
         aggressiveness = prefs.getInt("aggressiveness", 1)
+
         findViewById<Button>(R.id.btnToggle).setOnClickListener {
             cameraSelector = if (cameraSelector == CameraSelector.DEFAULT_BACK_CAMERA) CameraSelector.DEFAULT_FRONT_CAMERA else CameraSelector.DEFAULT_BACK_CAMERA
             startCamera()
         }
         findViewById<Button>(R.id.btnCapture).setOnClickListener { captureImage() }
 
-        // Set up GL renderer safely (textures created on GL thread)
+        // GL setup (renderer will handle buffers correctly)
         glSurfaceView.setEGLContextClientVersion(2)
         glSurfaceView.setRenderer(WarpRenderer(this))
         glSurfaceView.renderMode = GLSurfaceView.RENDERMODE_CONTINUOUSLY
@@ -64,29 +81,87 @@ class CameraActivity : AppCompatActivity() {
         startCamera()
     }
 
+    /**
+     * Robust model loader:
+     * - Checks file existence
+     * - Uses CompatibilityList to decide on GPU delegate
+     * - Tries GPU delegate, falls back to CPU interpreter
+     * - Loads pose detector with reasonable BaseOptions (threads), and only sets GPU use if supported
+     */
     private fun loadModelsSafe() {
-        if (!useEnhanced) return
-        try {
-            val midasFile = File(filesDir, "models/midas.tflite")
-            if (midasFile.exists()) {
-                val options = Interpreter.Options()
-                try {
-                    options.addDelegate(GpuDelegate())
-                } catch (_: Throwable) { /* if GPU delegate fails, continue without it */ }
-                midasInterpreter = Interpreter(FileUtil.loadMappedFile(this, midasFile.path), options)
-                FileLogger.d(this, "CameraActivity", "Loaded midas interpreter")
-            }
-            val poseFile = File(filesDir, "models/pose.tflite")
-            if (poseFile.exists()) {
-                val poseOptions = ObjectDetector.ObjectDetectorOptions.builder().setBaseOptions(
-                    org.tensorflow.lite.task.core.BaseOptions.builder().useGpu().build()
-                ).setMaxResults(1).build()
-                poseDetector = ObjectDetector.createFromFileAndOptions(this, poseFile.path, poseOptions)
-                FileLogger.d(this, "CameraActivity", "Loaded pose detector")
-            }
-        } catch (e: Exception) {
-            FileLogger.e(this, "CameraActivity", "Model load failed; disabling enhanced mode: ${e.message}")
+        if (!useEnhanced) {
+            FileLogger.d(this, "CameraActivity", "Enhanced mode disabled in settings")
+            return
+        }
+
+        val modelsDir = File(filesDir, "models")
+        if (!modelsDir.exists() || !modelsDir.isDirectory) {
+            FileLogger.e(this, "CameraActivity", "Models directory missing: ${modelsDir.absolutePath}")
             useEnhanced = false
+            return
+        }
+
+        // MiDaS
+        val midasFile = File(modelsDir, "midas.tflite")
+        if (!midasFile.exists()) {
+            FileLogger.e(this, "CameraActivity", "MiDaS model not found: ${midasFile.absolutePath}")
+            useEnhanced = false
+        } else {
+            try {
+                val compat = CompatibilityList()
+                val options = Interpreter.Options()
+                options.setNumThreads(2) // reasonable default; adjust if desired
+
+                if (compat.isDelegateSupportedOnThisDevice) {
+                    try {
+                        val delegate = GpuDelegate()
+                        options.addDelegate(delegate)
+                        gpuDelegate = delegate
+                        FileLogger.d(this, "CameraActivity", "GPU delegate created for MiDaS")
+                    } catch (de: Exception) {
+                        FileLogger.e(this, "CameraActivity", "Failed to create GpuDelegate: ${de.message}")
+                        // fall through to CPU
+                    }
+                } else {
+                    FileLogger.d(this, "CameraActivity", "GPU delegate not supported on device (CompatibilityList=false)")
+                }
+
+                // load mapped file (memory-mapped for faster loads)
+                val mapped = FileUtil.loadMappedFile(this, midasFile.path)
+                midasInterpreter = Interpreter(mapped, options)
+                FileLogger.d(this, "CameraActivity", "Loaded MiDaS interpreter: ${midasFile.absolutePath}")
+            } catch (e: Exception) {
+                FileLogger.e(this, "CameraActivity", "Model load failed; disabling enhanced mode: ${midasFile.absolutePath} -> ${e.message}")
+                // Clean up delegate if it was created
+                try { gpuDelegate?.close() } catch (_: Exception) {}
+                gpuDelegate = null
+                midasInterpreter = null
+                useEnhanced = false
+            }
+        }
+
+        // Pose detector
+        val poseFile = File(modelsDir, "pose.tflite")
+        if (!poseFile.exists()) {
+            FileLogger.e(this, "CameraActivity", "Pose model not found: ${poseFile.absolutePath}")
+            // not fatal — pose is optional
+        } else if (useEnhanced) {
+            try {
+                // If GPU delegate supported use task API with GPU; otherwise CPU
+                val baseOptBuilder = BaseOptions.builder().setNumThreads(2)
+                if (gpuDelegate != null) {
+                    // Some Task APIs prefer useGpu flag; but if GPU delegate already attached to Interpreter,
+                    // we prefer using CPU variant for Task to avoid double-gpu complexity.
+                    FileLogger.d(this, "CameraActivity", "Pose detector will load with CPU threads (GPU delegate present)")
+                }
+                val baseOptions = baseOptBuilder.build()
+                val objOptions = ObjectDetector.ObjectDetectorOptions.builder().setBaseOptions(baseOptions).setMaxResults(2).build()
+                poseDetector = ObjectDetector.createFromFileAndOptions(this, poseFile.path, objOptions)
+                FileLogger.d(this, "CameraActivity", "Loaded pose detector: ${poseFile.absolutePath}")
+            } catch (e: Exception) {
+                FileLogger.e(this, "CameraActivity", "Pose detector load failed: ${e.message}")
+                poseDetector = null
+            }
         }
     }
 
@@ -117,23 +192,27 @@ class CameraActivity : AppCompatActivity() {
 
     private fun processImage(image: ImageProxy) {
         try {
-            if (useEnhanced) {
-                val bmp = try { imageProxyToBitmap(image) } catch (e: Exception) { null }
-                bmp?.let { bitmap ->
+            if (useEnhanced && midasInterpreter != null) {
+                val bitmap = imageProxyToBitmap(image)
+                if (bitmap != null) {
                     try {
                         val scaled = Bitmap.createScaledBitmap(bitmap, 256, 256, true)
-                        val input = TensorImage.fromBitmap(scaled)
-                        val outputs = Array(1) { FloatArray(256 * 256) }
-                        midasInterpreter?.run(arrayOf(input.buffer), outputs)
+                        val timg = TensorImage.fromBitmap(scaled)
+                        // MiDaS expects float32 input — we'll attempt to run and fill outputs accordingly
+                        val outArr = Array(1) { FloatArray(256 * 256) }
+                        midasInterpreter?.run(timg.buffer, outArr)
                         depthMap = TensorBuffer.createFixedSize(intArrayOf(1, 256, 256, 1), org.tensorflow.lite.DataType.FLOAT32)
-                        depthMap?.loadArray(outputs[0])
+                        depthMap?.loadArray(outArr[0])
                     } catch (e: Exception) {
-                        FileLogger.e(this, "CameraActivity", "Depth infer failed: ${e.message}")
+                        FileLogger.e(this, "CameraActivity", "Depth inference failed: ${e.message}")
                     }
-                    try {
-                        val detections = poseDetector?.detect(TensorImage.fromBitmap(bitmap))
-                    } catch (e: Exception) {
-                        FileLogger.e(this, "CameraActivity", "Pose detect failed: ${e.message}")
+
+                    if (poseDetector != null) {
+                        try {
+                            poseDetector?.detect(TensorImage.fromBitmap(bitmap))
+                        } catch (e: Exception) {
+                            FileLogger.e(this, "CameraActivity", "Pose detect failed: ${e.message}")
+                        }
                     }
                 }
             }
@@ -145,17 +224,15 @@ class CameraActivity : AppCompatActivity() {
     }
 
     private fun imageProxyToBitmap(image: ImageProxy): Bitmap? {
-        try {
-            // Best-effort conversion. If the ImageProxy contains a JPEG byte buffer we decode it.
+        return try {
             val plane = image.planes[0]
             plane.buffer.rewind()
             val bytes = ByteArray(plane.buffer.remaining())
             plane.buffer.get(bytes)
-            // try decode - if image is NV21 this will fail; we catch and return null
-            return BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+            BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
         } catch (e: Exception) {
             FileLogger.e(this, "CameraActivity", "imageProxyToBitmap failed: ${e.message}")
-            return null
+            null
         }
     }
 
@@ -165,9 +242,6 @@ class CameraActivity : AppCompatActivity() {
             if (bmp != null) {
                 val warped = simpleWarp(bmp)
                 android.provider.MediaStore.Images.Media.insertImage(contentResolver, warped, "TwistedCapture", "Captured in Twisted Phone")
-                Toast.makeText(this, "Captured", Toast.LENGTH_SHORT).show()
-            } else {
-                Toast.makeText(this, "Capture failed", Toast.LENGTH_SHORT).show()
             }
         } catch (e: Exception) {
             FileLogger.e(this, "CameraActivity", "captureImage failed: ${e.message}")
@@ -195,15 +269,14 @@ class CameraActivity : AppCompatActivity() {
         private var program = 0
         private var textureId = 0
         private var surfaceTexture: android.graphics.SurfaceTexture? = null
-        private val mvpMatrix = FloatArray(16)
         private val projMatrix = FloatArray(16)
         private val viewMatrix = FloatArray(16)
         private var oesTexture = IntArray(1)
+        private var vBuffer: FloatBuffer? = null
 
         override fun onSurfaceCreated(gl: GL10?, config: EGLConfig?) {
             try {
                 GLES20.glClearColor(0f, 0f, 0f, 1f)
-                // create OES texture now that GL context exists
                 GLES20.glGenTextures(1, oesTexture, 0)
                 textureId = oesTexture[0]
                 GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, textureId)
@@ -213,6 +286,12 @@ class CameraActivity : AppCompatActivity() {
                 GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_CLAMP_TO_EDGE)
                 surfaceTexture = android.graphics.SurfaceTexture(textureId)
                 program = createProgram()
+                // native-order direct buffer (fixes "Must use a native order direct Buffer")
+                val arr = floatArrayOf(-1f, -1f, 1f, -1f, -1f, 1f, 1f, 1f)
+                val bb = java.nio.ByteBuffer.allocateDirect(arr.size * 4).order(ByteOrder.nativeOrder())
+                vBuffer = bb.asFloatBuffer()
+                vBuffer?.put(arr)
+                vBuffer?.position(0)
             } catch (e: Exception) {
                 FileLogger.e(ctx, "WarpRenderer", "onSurfaceCreated err: ${e.message}")
             }
@@ -229,7 +308,7 @@ class CameraActivity : AppCompatActivity() {
                 surfaceTexture?.updateTexImage()
                 GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT or GLES20.GL_DEPTH_BUFFER_BIT)
                 android.opengl.Matrix.setLookAtM(viewMatrix, 0, 0f, 0f, 3f, 0f, 0f, 0f, 0f, 1f, 0f)
-                android.opengl.Matrix.multiplyMM(mvpMatrix, 0, projMatrix, 0, viewMatrix, 0)
+                android.opengl.Matrix.multiplyMM(projMatrix, 0, projMatrix, 0, viewMatrix, 0)
                 GLES20.glUseProgram(program)
                 val timeLoc = GLES20.glGetUniformLocation(program, "time")
                 GLES20.glUniform1f(timeLoc, (System.currentTimeMillis() % 1000000) / 1000f)
@@ -239,9 +318,9 @@ class CameraActivity : AppCompatActivity() {
                 GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, textureId)
                 val texLoc = GLES20.glGetUniformLocation(program, "uTexture")
                 GLES20.glUniform1i(texLoc, 0)
-                val vBuffer: FloatBuffer = FloatBuffer.wrap(floatArrayOf(-1f, -1f, 1f, -1f, -1f, 1f, 1f, 1f))
                 val posLoc = GLES20.glGetAttribLocation(program, "vPosition")
                 GLES20.glEnableVertexAttribArray(posLoc)
+                vBuffer?.position(0)
                 GLES20.glVertexAttribPointer(posLoc, 2, GLES20.GL_FLOAT, false, 0, vBuffer)
                 GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
                 GLES20.glDisableVertexAttribArray(posLoc)
@@ -295,7 +374,8 @@ class CameraActivity : AppCompatActivity() {
 
     override fun onDestroy() {
         super.onDestroy()
-        midasInterpreter?.close()
-        poseDetector?.close()
+        try { midasInterpreter?.close() } catch (_: Exception) {}
+        try { gpuDelegate?.close() } catch (_: Exception) {}
+        try { poseDetector?.close() } catch (_: Exception) {}
     }
 }
