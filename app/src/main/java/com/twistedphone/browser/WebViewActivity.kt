@@ -1,300 +1,344 @@
 package com.twistedphone.browser
 
-import android.graphics.Color
-import android.os.Bundle
+import android.graphics.*
+import android.os.Build
 import android.os.Handler
 import android.os.Looper
-import android.view.View
-import android.view.ViewGroup
-import android.webkit.WebChromeClient
+import android.util.Base64
+import android.util.Log
 import android.webkit.WebView
 import android.webkit.WebViewClient
-import android.widget.*
 import androidx.appcompat.app.AppCompatActivity
+import android.os.Bundle
 import com.twistedphone.R
-import com.twistedphone.TwistedApp
 import com.twistedphone.ai.MistralClient
 import com.twistedphone.util.FileLogger
 import kotlinx.coroutines.*
 import org.json.JSONArray
 import org.json.JSONObject
-import kotlin.math.min
+import java.io.ByteArrayOutputStream
+import java.net.HttpURLConnection
+import java.net.URL
+import kotlin.random.Random
 
-/**
- * WebViewActivity
- * - Limits transform timeout to 15s total
- * - Sends text transforms in small batches (concurrency ~3)
- * - Sends image transforms in small batches (concurrency ~4)
- * - Applies whatever replacements finished when timeout hits
- */
 class WebViewActivity : AppCompatActivity() {
     private lateinit var web: WebView
-    private lateinit var progress: ProgressBar
-    private val scope = CoroutineScope(Dispatchers.Main + Job())
-    private val client = MistralClient()
-    private val prefs = TwistedApp.instance.settingsPrefs
-    private val cache = mutableMapOf<String, String>()
-    private var overlay: View? = null
+    private val scope = CoroutineScope(Dispatchers.Default + SupervisorJob())
     private val mainHandler = Handler(Looper.getMainLooper())
-    private var currentTransformJob: Job? = null
-    private val TRANSFORM_TIMEOUT_MS = 15_000L // reduced to 15s as requested
+    private val MAX_TIMEOUT_MS = 15_000L // 15 seconds
+    private var transformJob: Job? = null
 
-    override fun onCreate(s: Bundle?) {
-        super.onCreate(s)
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_webview)
-        web = findViewById(R.id.webview)
-        progress = findViewById(R.id.progressBar)
+        web = findViewById(R.id.webView)
         web.settings.javaScriptEnabled = true
-        web.webChromeClient = WebChromeClient()
         web.webViewClient = object : WebViewClient() {
-            override fun onPageStarted(view: WebView?, url: String?, favicon: android.graphics.Bitmap?) {
-                showOverlay()
+            override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
                 FileLogger.d(this@WebViewActivity, "WebViewActivity", "onPageStarted: $url")
-                currentTransformJob?.cancel()
             }
             override fun onPageFinished(view: WebView?, url: String?) {
                 FileLogger.d(this@WebViewActivity, "WebViewActivity", "onPageFinished: $url")
-                if (url != null) performTransformations(url) else hideOverlay()
+                startTransform(url ?: "")
             }
         }
-        addAddressBar()
-        web.loadUrl("https://en.wikipedia.org/wiki/Main_Page")
+        // load starter
+        web.loadUrl("https://en.m.wikipedia.org/wiki/Main_Page")
     }
 
-    private fun addAddressBar() {
-        val root = findViewById<ViewGroup>(android.R.id.content)
-        val bar = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            setBackgroundColor(Color.parseColor("#F6F6F6"))
-            setPadding(8, 8, 8, 8)
-            elevation = 6f
-        }
-        val et = EditText(this).apply {
-            hint = "Enter URL"
-            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
-            setSingleLine(true)
-        }
-        val go = Button(this).apply {
-            text = "Go"
-            setOnClickListener {
-                val txt = et.text.toString().trim()
-                if (txt.isNotEmpty()) {
-                    val final = if (txt.startsWith("http")) txt else "https://$txt"
-                    web.loadUrl(final)
-                    showOverlay()
-                }
-            }
-        }
-        val back = Button(this).apply { text = "Back"; setOnClickListener { if (web.canGoBack()) web.goBack() } }
-        bar.addView(et); bar.addView(go); bar.addView(back)
-        (root.getChildAt(0) as ViewGroup).addView(bar)
-        web.setPadding(0, (56 * resources.displayMetrics.density).toInt(), 0, 0)
-    }
-
-    private fun showOverlay() {
-        try {
-            if (overlay?.parent != null) return
-            val root = findViewById<ViewGroup>(android.R.id.content)
-            overlay = View(this).apply { setBackgroundColor(Color.WHITE); isClickable = true }
-            val p = FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
-            (root.getChildAt(0) as ViewGroup).addView(overlay, p)
-            progress.visibility = View.VISIBLE
-        } catch (e: Exception) {
-            FileLogger.e(this, "WebViewActivity", "showOverlay error: ${e.message}")
-        }
-    }
-
-    private fun hideOverlay() {
-        try {
-            progress.visibility = View.GONE
-            if (overlay?.parent != null) (overlay?.parent as ViewGroup).removeView(overlay)
-            overlay = null
-        } catch (e: Exception) {
-            FileLogger.e(this, "WebViewActivity", "hideOverlay error: ${e.message}")
-        }
-    }
-
-    /**
-     * Perform transformations with:
-     * - global timeout of TRANSFORM_TIMEOUT_MS
-     * - batch-processing (batch size 3 for texts, 4 for images)
-     * - apply whatever completed when timeout finishes
-     */
-    private fun performTransformations(url: String) {
-        currentTransformJob = scope.launch {
+    private fun startTransform(url: String) {
+        transformJob?.cancel()
+        // inject overlay immediately to hide unaltered DOM
+        injectLoadingOverlay(0)
+        transformJob = scope.launch {
             try {
                 FileLogger.d(this@WebViewActivity, "WebViewActivity", "performTransformations start for $url")
-                cache[url]?.let { cachedJs ->
-                    web.evaluateJavascript(cachedJs, null)
-                    FileLogger.d(this@WebViewActivity, "WebViewActivity", "Applied cached transform for $url")
-                    hideOverlay()
-                    return@launch
+                val start = System.currentTimeMillis()
+                val textsAndImgs = extractTopTextsAndImages() // will run JS and return parsed JSON
+                val texts = textsAndImgs.first
+                val imgs = textsAndImgs.second
+                FileLogger.d(this@WebViewActivity, "WebViewActivity", "Found texts=${texts.size} imgs=${imgs.size} (top10)")
+
+                val totalWork = texts.size + imgs.size
+                var done = 0
+
+                // enforce overall timeout using coroutine with select or manual check
+                val deadline = start + MAX_TIMEOUT_MS
+
+                // --- process texts (send to Mistral) ---
+                val replacements = mutableMapOf<String, String>() // xpath -> replacement
+                for ((idx, item) in texts.withIndex()) {
+                    if (!isActive) return@launch
+                    // if timed out -> break
+                    if (System.currentTimeMillis() > deadline) {
+                        FileLogger.d(this@WebViewActivity, "WebViewActivity", "Timed out during text transforms")
+                        break
+                    }
+                    val original = item.getString("text")
+                    val xpath = item.getString("xpath")
+                    FileLogger.d(this@WebViewActivity, "WebViewActivity", "Sending to Mistral: ${original.take(200)}")
+                    val twisted = MistralClient.twistTextWithRetries(original, 1, 4) ?: original
+                    replacements[xpath] = twisted
+                    done++
+                    updateProgress((done.toFloat() / totalWork.toFloat() * 100).toInt())
                 }
 
-                val jsExtract = """
-                (function(){
-                    function getXPath(node){
-                        if(!node) return '';
-                        var path='';
-                        while(node && node.nodeType==Node.ELEMENT_NODE){
-                            var sib=node.previousSibling, idx=1;
-                            while(sib){ if(sib.nodeType==Node.ELEMENT_NODE && sib.tagName==node.tagName) idx++; sib=sib.previousSibling; }
-                            path='/'+node.tagName.toLowerCase()+'['+idx+']'+path;
-                            node=node.parentNode;
-                        }
-                        return path;
-                    }
-                    function visible(el){
-                        if(!el) return false;
-                        if(el.hasAttribute && el.hasAttribute('hidden')) return false;
-                        var rects = el.getClientRects();
-                        if(!rects || rects.length===0) return false;
-                        var cs = window.getComputedStyle(el);
-                        if(!cs) return true;
-                        if(cs.visibility==='hidden' || cs.display==='none') return false;
-                        if(parseFloat(cs.opacity||1) < 0.1) return false;
-                        return true;
-                    }
-                    var walker=document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT,null,false);
-                    var texts=[];
-                    while(walker.nextNode()){
-                        var t = walker.currentNode.nodeValue.trim();
-                        if(!t || t.length < 30) continue;
-                        var parent = walker.currentNode.parentNode;
-                        var tag = parent && parent.tagName ? parent.tagName.toLowerCase() : '';
-                        if(['script','style','noscript','svg','code','pre','head','link','meta'].indexOf(tag) !== -1) continue;
-                        if(!visible(parent)) continue;
-                        if(/^[\.\{\<\[\#\*]/.test(t)) continue;
-                        if(t.indexOf('http') !== -1) continue;
-                        if(t.indexOf('{')!==-1 && t.indexOf('}')!==-1) continue;
-                        texts.push({text:t, xpath:getXPath(parent), len:t.length});
-                    }
-                    texts.sort(function(a,b){ return b.len - a.len; });
-                    texts = texts.slice(0,10);
-                    var imgs = Array.from(document.images).filter(function(i){ try { return (i.naturalWidth||0) > 40 && (i.src||'').indexOf('http')===0; } catch(e){ return false; }}).map(function(i){ return {src:i.src||'', area:(i.naturalWidth||0)*(i.naturalHeight||0), xpath:getXPath(i)};});
-                    imgs.sort(function(a,b){ return b.area - a.area; });
-                    imgs = imgs.slice(0,10);
-                    return JSON.stringify({texts:texts, imgs:imgs});
-                })();
-                """.trimIndent()
-
-                val raw = evaluateJavascriptSafely(jsExtract)
-                FileLogger.d(this@WebViewActivity, "WebViewActivity", "jsExtract raw: ${raw?.take(400)}")
-                if (raw == null) {
-                    FileLogger.e(this@WebViewActivity, "WebViewActivity", "Extraction returned null")
-                    hideOverlay(); return@launch
+                // inject text replacements in a single JS call
+                if (replacements.isNotEmpty()) {
+                    val js = buildReplaceTextJs(replacements)
+                    evaluateJsOnMain(js)
                 }
 
-                // parse extractor result
-                val clean = try { JSONArray("[$raw]").getString(0) } catch (e: Exception) { raw }
-                val jo = JSONObject(clean)
-                val texts = jo.optJSONArray("texts") ?: JSONArray()
-                val imgs = jo.optJSONArray("imgs") ?: JSONArray()
-                FileLogger.d(this@WebViewActivity, "WebViewActivity", "Found texts=${texts.length()} imgs=${imgs.length()} (top10)")
-
-                // Prepare storage for replacements
-                val twistedPairs = mutableListOf<Pair<String,String>>()
-                val imgPairs = mutableListOf<Pair<String,String>>()
-
-                // batch-run text transforms (batch size 3)
-                val batchSizeText = 3
-                val totalTexts = min(10, texts.length())
-                val textScope = CoroutineScope(Dispatchers.IO + Job())
-
-                withTimeoutOrNull(TRANSFORM_TIMEOUT_MS) {
-                    var i = 0
-                    while (i < totalTexts) {
-                        val end = min(i + batchSizeText, totalTexts)
-                        val batch = (i until end).map { idx ->
-                            val tjo = texts.getJSONObject(idx)
-                            val original = tjo.optString("text")
-                            val xpath = tjo.optString("xpath")
-                            textScope.async {
-                                try {
-                                    FileLogger.d(this@WebViewActivity, "WebViewActivity", "Sending to Mistral: ${original.take(200)}")
-                                    val twisted = client.twistTextWithRetries(original, maxAttempts = 3)
-                                    FileLogger.d(this@WebViewActivity, "WebViewActivity", "Mistral responded (len=${twisted.length}) example: ${twisted.take(200)}")
-                                    if (twisted.isNotBlank() && twisted != original) synchronized(twistedPairs) { twistedPairs.add(Pair(xpath, twisted)) }
-                                } catch (e: Exception) {
-                                    FileLogger.e(this@WebViewActivity, "WebViewActivity", "text transform failed: ${e.message}")
-                                }
-                            }
-                        }
-                        // await this batch
-                        batch.awaitAll()
-                        i = end
+                // --- process images ---
+                for ((idx, src) in imgs.withIndex()) {
+                    if (!isActive) break
+                    if (System.currentTimeMillis() > deadline) {
+                        FileLogger.d(this@WebViewActivity, "WebViewActivity", "Timed out during image transforms")
+                        break
                     }
-                    // images: batch size 4
-                    val batchSizeImg = 4
-                    val totalImgs = min(10, imgs.length())
-                    val imgScope = CoroutineScope(Dispatchers.IO + Job())
-                    var j = 0
-                    while (j < totalImgs) {
-                        val endj = min(j + batchSizeImg, totalImgs)
-                        val batchImg = (j until endj).map { idx ->
-                            val ijo = imgs.getJSONObject(idx)
-                            val src = ijo.optString("src")
-                            imgScope.async {
-                                try {
-                                    FileLogger.d(this@WebViewActivity, "WebViewActivity", "Downloading image for face-detection: ${src.take(200)}")
-                                    val transformed = client.transformImageToDataUri(src, localDarken = true)
-                                    if (!transformed.isNullOrBlank() && transformed != src) {
-                                        synchronized(imgPairs) { imgPairs.add(Pair(src, transformed)) }
-                                        FileLogger.d(this@WebViewActivity, "WebViewActivity", "Image transformed for ${src.take(120)}")
+                    try {
+                        FileLogger.d(this@WebViewActivity, "WebViewActivity", "Downloading image for face-detection: $src")
+                        val bmp = downloadBitmap(src)
+                        if (bmp != null) {
+                            val processed = darkenFaces(bmp)
+                            val dataUri = bitmapToDataUri(processed)
+                            // inject replacement for that src
+                            val injectJs = """
+                                (function(){
+                                  var imgs = document.getElementsByTagName('img');
+                                  for(var i=0;i<imgs.length;i++){
+                                    if(imgs[i].src && imgs[i].src.indexOf("${escapeForJs(src)}")!==-1){
+                                      imgs[i].src = "${dataUri}";
                                     }
-                                } catch (e: Exception) {
-                                    FileLogger.e(this@WebViewActivity, "WebViewActivity", "Image transform failed: ${e.message}")
-                                }
-                            }
+                                  }
+                                })();
+                            """.trimIndent()
+                            evaluateJsOnMain(injectJs)
                         }
-                        batchImg.awaitAll()
-                        j = endj
+                    } catch (e: Exception) {
+                        FileLogger.e(this@WebViewActivity, "WebViewActivity", "image transform failed: ${e.message}")
                     }
-                } // end withTimeoutOrNull
-
-                // Build JS replacements for whatever we have
-                val jsReplace = StringBuilder("(function(){")
-                for ((xpath, twisted) in twistedPairs) {
-                    jsReplace.append("try{var n=document.evaluate('${escapeJs(xpath)}',document,null,XPathResult.FIRST_ORDERED_NODE_TYPE,null).singleNodeValue; if(n){ n.textContent = ${JSONObject.quote(twisted)}; }}catch(e){};")
+                    done++
+                    updateProgress((done.toFloat() / totalWork.toFloat() * 100).toInt())
                 }
-                for ((src, dataUri) in imgPairs) {
-                    jsReplace.append("try{var imgs=document.images; for(var i=0;i<imgs.length;i++){ if(imgs[i].src==${JSONObject.quote(src)}||imgs[i].src==${JSONObject.quote(src.trim())}) imgs[i].src=${JSONObject.quote(dataUri)}; }}catch(e){};")
-                }
-                jsReplace.append("})();")
 
-                // Apply JS even if some transforms timed out - show what's done
-                web.evaluateJavascript(jsReplace.toString(), null)
-                cache[url] = jsReplace.toString()
-                FileLogger.d(this@WebViewActivity, "WebViewActivity", "Injected replacements (texts=${twistedPairs.size}, images=${imgPairs.size})")
-            } catch (e: CancellationException) {
-                FileLogger.d(this@WebViewActivity, "WebViewActivity", "Transform job cancelled")
+                // finished: remove overlay
+                evaluateJsOnMain("document.getElementById('__twisted_overlay__') && document.getElementById('__twisted_overlay__').remove();")
+                FileLogger.d(this@WebViewActivity, "WebViewActivity", "Injected replacements (texts=${replacements.size}, images=${imgs.size})")
             } catch (e: Exception) {
-                FileLogger.e(this@WebViewActivity, "WebViewActivity", "performTransformations error: ${e.message}")
-            } finally {
-                // Ensure overlay is removed after a short delay so user sees page
-                mainHandler.postDelayed({ hideOverlay() }, 300)
+                FileLogger.e(this@WebViewActivity, "WebViewActivity", "Transform job failed: ${e.message}")
+                // ensure overlay removed on failure
+                evaluateJsOnMain("document.getElementById('__twisted_overlay__') && document.getElementById('__twisted_overlay__').remove();")
             }
         }
+
+        // enforce hard timeout: cancel transformJob after MAX_TIMEOUT_MS and remove overlay
+        mainHandler.postDelayed({
+            transformJob?.cancel()
+            evaluateJsOnMain("document.getElementById('__twisted_overlay__') && document.getElementById('__twisted_overlay__').remove();")
+            FileLogger.d(this@WebViewActivity, "WebViewActivity", "Transform timeout after ${MAX_TIMEOUT_MS}ms")
+        }, MAX_TIMEOUT_MS)
     }
 
-    private suspend fun evaluateJavascriptSafely(js: String): String? = withContext(Dispatchers.Main) {
-        val deferred = CompletableDeferred<String?>()
-        try {
-            web.evaluateJavascript(js) { result ->
-                deferred.complete(result)
+    private suspend fun extractTopTextsAndImages(): Pair<List<JSONObject>, List<String>> = withContext(Dispatchers.Main) {
+        // JS: gather visible text nodes (simple heuristic) and img srcs; return JSON string
+        val js = """
+            (function(){
+              function visible(el){
+                var s = window.getComputedStyle(el);
+                return s && s.display !== 'none' && s.visibility !== 'hidden' && s.opacity !== '0';
+              }
+              var texts = [];
+              var walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, {acceptNode: function(node){ if(node && node.nodeValue && node.nodeValue.trim().length>20) return NodeFilter.FILTER_ACCEPT; return NodeFilter.FILTER_REJECT }}, false);
+              var i=0;
+              while(walker.nextNode() && texts.length<10){
+                var n = walker.currentNode.nodeValue.trim();
+                var p = walker.currentNode.parentElement;
+                if(p && visible(p)){
+                  var xpath = '';
+                  try {
+                    xpath = getXPathForElement(p);
+                  } catch(e){}
+                  texts.push({text:n, xpath:xpath, len:n.length});
+                }
+              }
+              // helper for xpath
+              function getXPathForElement(el) {
+                if(el.id) return 'id("'+el.id+'")';
+                var segs = [];
+                for(; el && el.nodeType == 1; el = el.parentNode){
+                  var idx = 1;
+                  for(var sib = el.previousSibling; sib; sib = sib.previousSibling){
+                    if(sib.nodeType === 1 && sib.nodeName === el.nodeName) idx++;
+                  }
+                  var name = el.nodeName.toLowerCase();
+                  segs.unshift(name + '[' + idx + ']');
+                }
+                return '/' + segs.join('/');
+              }
+              var imgs = [];
+              var imgelems = document.getElementsByTagName('img');
+              for(var j=0;j<imgelems.length && imgs.length<10;j++){
+                var s = imgelems[j].src;
+                if(s && s.length>0 && s.indexOf('data:')!==0) imgs.push(s);
+              }
+              return JSON.stringify({texts:texts,imgs:imgs});
+            })();
+        """.trimIndent()
+
+        val deferred = CompletableDeferred<Pair<List<JSONObject>, List<String>>>()
+        web.evaluateJavascript(js) { raw ->
+            try {
+                val unquoted = raw?.let {
+                    if (it.length >= 2 && it.startsWith("\"") && it.endsWith("\"")) {
+                        // JS returned a quoted string — unescape
+                        org.json.JSONTokener("\"\"\"\"")
+                        org.json.JSONObject("{}") // no-op
+                        val s = it.substring(1, it.length - 1).replace("\\\\n", "\n").replace("\\\\\"", "\"").replace("\\\\\\\\", "\\")
+                        s
+                    } else it
+                } ?: ""
+                val obj = JSONObject(unquoted)
+                val arr = obj.getJSONArray("texts")
+                val texts = mutableListOf<JSONObject>()
+                for (i in 0 until arr.length()) texts.add(arr.getJSONObject(i))
+                val imgsJson = obj.getJSONArray("imgs")
+                val imgs = mutableListOf<String>()
+                for (i in 0 until imgsJson.length()) imgs.add(imgsJson.getString(i))
+                deferred.complete(Pair(texts, imgs))
+            } catch (e: Exception) {
+                deferred.completeExceptionally(e)
             }
-            deferred.await()
+        }
+        return@withContext deferred.await()
+    }
+
+    // Build JS that replaces text nodes by xpath. We set element.innerText = ...
+    private fun buildReplaceTextJs(map: Map<String, String>): String {
+        val sb = StringBuilder()
+        sb.append("(function(){")
+        for ((xpath, repl) in map) {
+            val esc = escapeForJs(repl)
+            // try id("...") special case else try xpath evaluation
+            if (xpath.startsWith("id(\"") && xpath.endsWith("\")")) {
+                val id = xpath.substring(4, xpath.length - 2)
+                sb.append("var el=document.getElementById(\"${escapeForJs(id)}\"); if(el) el.innerText = \"${esc}\";")
+            } else {
+                sb.append("try{var result=document.evaluate(\"${escapeForJs(xpath)}\", document, null, XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null); if(result && result.snapshotLength>0){ for(var i=0;i<result.snapshotLength;i++){ try{ result.snapshotItem(i).innerText = \"${esc}\";}catch(e){} } }}catch(ee){};")
+            }
+        }
+        sb.append("})();")
+        return sb.toString()
+    }
+
+    private fun evaluateJsOnMain(js: String) {
+        mainHandler.post { web.evaluateJavascript(js, null) }
+    }
+
+    private fun updateProgress(percent: Int) {
+        val safe = percent.coerceIn(0, 100)
+        // update overlay percent
+        val js = """
+            (function(){
+              var d = document.getElementById('__twisted_overlay__');
+              if(!d){
+                d = document.createElement('div');
+                d.id='__twisted_overlay__';
+                d.style.position='fixed';
+                d.style.left='0';d.style.top='0';d.style.right='0';d.style.bottom='0';
+                d.style.background='white';
+                d.style.zIndex='2147483647';
+                d.style.display='flex';
+                d.style.alignItems='center';
+                d.style.justifyContent='center';
+                d.style.flexDirection='column';
+                var t = document.createElement('div'); t.id='__twisted_percent__'; t.style.fontSize='22px'; t.style.color='black';
+                d.appendChild(t); document.body.appendChild(d);
+              }
+              var e = document.getElementById('__twisted_percent__');
+              if(e) e.innerText = 'Twisting… ${safe}%';
+            })();
+        """.trimIndent()
+        evaluateJsOnMain(js)
+    }
+
+    private fun injectLoadingOverlay(initialPercent: Int) {
+        updateProgress(initialPercent)
+    }
+
+    // download bitmap (best-effort)
+    private fun downloadBitmap(urlStr: String): Bitmap? {
+        return try {
+            val u = URL(urlStr)
+            val conn = (u.openConnection() as HttpURLConnection).apply { connectTimeout = 7000; readTimeout = 9000 }
+            conn.requestMethod = "GET"
+            conn.connect()
+            val code = conn.responseCode
+            if (code in 200..299) {
+                val isStream = conn.inputStream
+                val bmp = BitmapFactory.decodeStream(isStream)
+                isStream.close()
+                conn.disconnect()
+                bmp
+            } else {
+                conn.disconnect()
+                null
+            }
         } catch (e: Exception) {
-            FileLogger.e(this@WebViewActivity, "WebViewActivity", "evaluateJavascript error: ${e.message}")
+            FileLogger.e(this, "WebViewActivity", "downloadBitmap error: ${e.message}")
             null
         }
     }
 
-    private fun escapeJs(s: String): String = s.replace("'", "\\'")
+    // lightweight face detection using android.media.FaceDetector (works on RGB_565, limited but local & tiny)
+    private fun darkenFaces(src: Bitmap): Bitmap {
+        try {
+            val w = min(800, src.width)
+            val aspect = src.height.toFloat() / src.width
+            val h = (w * aspect).toInt()
+            val scaled = Bitmap.createScaledBitmap(src, w, h, true)
+            // android.media.FaceDetector requires RGB_565
+            val fdBmp = scaled.copy(Bitmap.Config.RGB_565, true)
+            val faceDetector = android.media.FaceDetector(fdBmp.width, fdBmp.height, 5)
+            val faces = arrayOfNulls<android.media.FaceDetector.Face>(5)
+            val count = faceDetector.findFaces(fdBmp, faces)
+            if (count <= 0) return src
+            val out = Bitmap.createBitmap(fdBmp.width, fdBmp.height, Bitmap.Config.ARGB_8888)
+            val c = Canvas(out)
+            c.drawBitmap(fdBmp, 0f, 0f, null)
+            val paint = Paint().apply { color = Color.argb(200, 0, 0, 0); style = Paint.Style.FILL }
+            for (i in 0 until count) {
+                val f = faces[i] ?: continue
+                val eyes = PointF(); f.getMidPoint(eyes); val eyesX = eyes.x; val eyesY = eyes.y
+                val eyesDist = f.eyesDistance()
+                val left = (eyesX - eyesDist * 1.6f).coerceAtLeast(0f)
+                val top = (eyesY - eyesDist * 1.6f).coerceAtLeast(0f)
+                val right = (eyesX + eyesDist * 1.6f).coerceAtMost(fdBmp.width.toFloat())
+                val bottom = (eyesY + eyesDist * 1.6f).coerceAtMost(fdBmp.height.toFloat())
+                c.drawRect(left, top, right, bottom, paint)
+            }
+            // scale back to original width
+            val finalBmp = Bitmap.createScaledBitmap(out, src.width, src.height, true)
+            return finalBmp
+        } catch (e: Exception) {
+            FileLogger.e(this, "WebViewActivity", "darkenFaces err: ${e.message}")
+            return src
+        }
+    }
+
+    private fun bitmapToDataUri(bmp: Bitmap): String {
+        val baos = ByteArrayOutputStream()
+        bmp.compress(Bitmap.CompressFormat.PNG, 90, baos)
+        val encoded = Base64.encodeToString(baos.toByteArray(), Base64.NO_WRAP)
+        return "data:image/png;base64,$encoded"
+    }
+
+    private fun escapeForJs(s: String): String {
+        return s.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n").replace("\r", "\\r")
+    }
 
     override fun onDestroy() {
         super.onDestroy()
-        currentTransformJob?.cancel()
         scope.cancel()
     }
 }
