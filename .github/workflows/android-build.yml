@@ -6,7 +6,6 @@ on:
   pull_request:
   workflow_dispatch:
 
-# Minimal permissions to avoid unnecessary blocking
 permissions:
   contents: read
   actions: read
@@ -65,12 +64,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-
           SDKROOT="${RUNNER_TEMP}/android-sdk"
           mkdir -p "${SDKROOT}"
           echo "Using SDKROOT=${SDKROOT}"
-
-          # Prefer sdkmanager on PATH if available
           if command -v sdkmanager >/dev/null 2>&1; then
             SDKMANAGER_CMD="$(command -v sdkmanager)"
           else
@@ -80,7 +76,6 @@ jobs:
             rm -rf "${SDKROOT}/cmdline-tools"
             mkdir -p "${SDKROOT}/cmdline-tools/latest"
             unzip -q "$ZIP" -d "${SDKROOT}/cmdline-tools/latest"
-            # flatten if nested
             if [ -d "${SDKROOT}/cmdline-tools/latest/cmdline-tools" ]; then
               mv "${SDKROOT}/cmdline-tools/latest/cmdline-tools/"* "${SDKROOT}/cmdline-tools/latest/" || true
               rmdir "${SDKROOT}/cmdline-tools/latest/cmdline-tools" || true
@@ -88,17 +83,11 @@ jobs:
             SDKMANAGER_CMD="${SDKROOT}/cmdline-tools/latest/bin/sdkmanager"
             chmod +x "${SDKMANAGER_CMD}"
           fi
-
           echo "sdkmanager => ${SDKMANAGER_CMD}"
-
-          # Install what we need for compileSdk 34 + build-tools 34.0.0
           yes | "${SDKMANAGER_CMD}" --sdk_root="${SDKROOT}" "platform-tools" "platforms;android-34" "build-tools;34.0.0" "cmdline-tools;latest" || true
           yes | "${SDKMANAGER_CMD}" --sdk_root="${SDKROOT}" --licenses || true
-
-          # Make available to later steps
           echo "ANDROID_SDK_ROOT=${SDKROOT}" >> "${GITHUB_ENV}"
           echo "${SDKROOT}/platform-tools" >> "${GITHUB_PATH}"
-
           echo "Android SDK components installed to ${SDKROOT}"
 
       - name: Print Java & Gradle versions (for logs)
