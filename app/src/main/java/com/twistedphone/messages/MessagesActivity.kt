@@ -1,11 +1,12 @@
 package com.twistedphone.messages
 
-import android.content.Intent
+import android.graphics.Color
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.util.TypedValue
 import android.view.Gravity
+import android.view.ViewGroup
 import android.widget.Button
 import android.widget.EditText
 import android.widget.LinearLayout
@@ -15,16 +16,12 @@ import com.twistedphone.R
 import com.twistedphone.alt.AltMessageService
 import com.twistedphone.util.FileLogger
 
-/**
- * MessagesActivity — displays messages stacked vertically.
- * Uses MessageStore.addMessage(ctx, who, text) (three-argument form).
- */
 class MessagesActivity : AppCompatActivity() {
 
     private lateinit var container: LinearLayout
 
-    override fun onCreate(savedInstanceState: Bundle?) {
-        super.onCreate(savedInstanceState)
+    override fun onCreate(s: Bundle?) {
+        super.onCreate(s)
         setContentView(R.layout.activity_messages)
 
         container = findViewById(R.id.messagesContainer)
@@ -36,30 +33,47 @@ class MessagesActivity : AppCompatActivity() {
             val t = input.text.toString().trim()
             if (t.isNotEmpty()) {
                 try {
-                    // Correct call that matches MessageStore.addMessage(ctx, who, text)
                     MessageStore.addMessage(this, "YOU", t)
                 } catch (e: Exception) {
-                    // Log and return early — do not attempt alternate signatures
                     FileLogger.e(this, "MessagesActivity", "addMessage failed: ${e.message}")
                     return@setOnClickListener
                 }
                 input.text.clear()
-                // Update UI in-place
                 refreshMessages()
-
-                // schedule AS reply after short delay
                 Handler(Looper.getMainLooper()).postDelayed({
                     try {
-                        val svcIntent = Intent(this, AltMessageService::class.java)
+                        val svcIntent = android.content.Intent(this, AltMessageService::class.java)
                         svcIntent.putExtra("is_reply", true)
                         startService(svcIntent)
-                        FileLogger.d(this, "MessagesActivity", "Scheduled AltMessageService reply")
-                    } catch (e: Exception) {
-                        FileLogger.e(this, "MessagesActivity", "Failed to start AltMessageService: ${e.message}")
-                    }
+                    } catch (e: Exception) { FileLogger.e(this,"MessagesActivity","start alt failed: ${e.message}") }
                 }, 5000)
             }
         }
+    }
+
+    private fun bubbleView(text: String, isUser: Boolean): LinearLayout {
+        val wrapper = LinearLayout(this)
+        val lpWrap = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+        lpWrap.setMargins(8, 8, 8, 8)
+        wrapper.layoutParams = lpWrap
+        wrapper.gravity = if (isUser) Gravity.START else Gravity.END
+
+        val bubble = TextView(this)
+        bubble.setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f)
+        bubble.text = text
+        bubble.setTextColor(Color.WHITE)
+        bubble.setPadding(18, 12, 18, 12)
+        val bubbleLp = LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+        if (isUser) {
+            bubble.setBackgroundResource(R.drawable.bubble_left)
+            bubbleLp.gravity = Gravity.START
+        } else {
+            bubble.setBackgroundResource(R.drawable.bubble_right)
+            bubbleLp.gravity = Gravity.END
+        }
+        bubble.layoutParams = bubbleLp
+        wrapper.addView(bubble)
+        return wrapper
     }
 
     private fun refreshMessages() {
@@ -67,32 +81,12 @@ class MessagesActivity : AppCompatActivity() {
             container.removeAllViews()
             val msgs = MessageStore.allMessages(this)
             for (m in msgs) {
-                // stored format: "WHO|timestamp|text"
                 val parts = m.split("|", limit = 3)
                 val who = parts.getOrNull(0) ?: ""
-                val meta = parts.getOrNull(1) ?: ""
+                val ts = parts.getOrNull(1) ?: ""
                 val text = parts.getOrNull(2) ?: ""
-
-                val block = LinearLayout(this).apply {
-                    orientation = LinearLayout.VERTICAL
-                    val lp = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT)
-                    lp.setMargins(8, 8, 8, 8)
-                    layoutParams = lp
-                }
-
-                val tvMain = TextView(this).apply {
-                    setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f)
-                    this.text = text
-                    gravity = Gravity.START
-                }
-                val tvMeta = TextView(this).apply {
-                    setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
-                    this.text = meta
-                    gravity = Gravity.END
-                }
-                block.addView(tvMain)
-                block.addView(tvMeta)
-                container.addView(block)
+                val isUser = who == "YOU"
+                container.addView(bubbleView(text, isUser))
             }
         } catch (e: Exception) {
             FileLogger.e(this, "MessagesActivity", "refreshMessages failed: ${e.message}")
