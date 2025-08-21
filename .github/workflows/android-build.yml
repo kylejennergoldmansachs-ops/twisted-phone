@@ -23,18 +23,6 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Early debug: runner & repo info
-        run: |
-          echo "=== DEBUG START ==="
-          echo "Date: $(date -u)"
-          echo "Actor: $GITHUB_ACTOR"
-          echo "Event: $GITHUB_EVENT_NAME"
-          echo "Ref: $GITHUB_REF"
-          echo "Workspace: $GITHUB_WORKSPACE"
-          echo "Runner temp: $RUNNER_TEMP"
-          echo "---- ls workspace ----"
-          ls -la
-          echo "=== DEBUG END ==="
 
       - name: Setup JDK 17 (Temurin)
         uses: actions/setup-java@v4
