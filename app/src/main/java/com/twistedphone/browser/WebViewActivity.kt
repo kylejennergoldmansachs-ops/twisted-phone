@@ -4,8 +4,6 @@ import android.graphics.Color
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
-import android.util.Log
-import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
 import android.webkit.WebChromeClient
@@ -20,7 +18,15 @@ import com.twistedphone.util.FileLogger
 import kotlinx.coroutines.*
 import org.json.JSONArray
 import org.json.JSONObject
+import kotlin.math.min
 
+/**
+ * WebViewActivity
+ * - Limits transform timeout to 15s total
+ * - Sends text transforms in small batches (concurrency ~3)
+ * - Sends image transforms in small batches (concurrency ~4)
+ * - Applies whatever replacements finished when timeout hits
+ */
 class WebViewActivity : AppCompatActivity() {
     private lateinit var web: WebView
     private lateinit var progress: ProgressBar
@@ -29,8 +35,9 @@ class WebViewActivity : AppCompatActivity() {
     private val prefs = TwistedApp.instance.settingsPrefs
     private val cache = mutableMapOf<String, String>()
     private var overlay: View? = null
-    private var currentTransformJob: Job? = null
     private val mainHandler = Handler(Looper.getMainLooper())
+    private var currentTransformJob: Job? = null
+    private val TRANSFORM_TIMEOUT_MS = 15_000L // reduced to 15s as requested
 
     override fun onCreate(s: Bundle?) {
         super.onCreate(s)
@@ -45,14 +52,11 @@ class WebViewActivity : AppCompatActivity() {
                 FileLogger.d(this@WebViewActivity, "WebViewActivity", "onPageStarted: $url")
                 currentTransformJob?.cancel()
             }
-
             override fun onPageFinished(view: WebView?, url: String?) {
                 FileLogger.d(this@WebViewActivity, "WebViewActivity", "onPageFinished: $url")
-                if (url != null) performTransformations(url)
-                else hideOverlay()
+                if (url != null) performTransformations(url) else hideOverlay()
             }
         }
-
         addAddressBar()
         web.loadUrl("https://en.wikipedia.org/wiki/Main_Page")
     }
@@ -70,14 +74,17 @@ class WebViewActivity : AppCompatActivity() {
             layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
             setSingleLine(true)
         }
-        val go = Button(this).apply { text = "Go"; setOnClickListener {
-            val txt = et.text.toString().trim()
-            if (txt.isNotEmpty()) {
-                val final = if (txt.startsWith("http")) txt else "https://$txt"
-                web.loadUrl(final)
-                showOverlay()
+        val go = Button(this).apply {
+            text = "Go"
+            setOnClickListener {
+                val txt = et.text.toString().trim()
+                if (txt.isNotEmpty()) {
+                    val final = if (txt.startsWith("http")) txt else "https://$txt"
+                    web.loadUrl(final)
+                    showOverlay()
+                }
             }
-        } }
+        }
         val back = Button(this).apply { text = "Back"; setOnClickListener { if (web.canGoBack()) web.goBack() } }
         bar.addView(et); bar.addView(go); bar.addView(back)
         (root.getChildAt(0) as ViewGroup).addView(bar)
@@ -107,6 +114,12 @@ class WebViewActivity : AppCompatActivity() {
         }
     }
 
+    /**
+     * Perform transformations with:
+     * - global timeout of TRANSFORM_TIMEOUT_MS
+     * - batch-processing (batch size 3 for texts, 4 for images)
+     * - apply whatever completed when timeout finishes
+     */
     private fun performTransformations(url: String) {
         currentTransformJob = scope.launch {
             try {
@@ -118,7 +131,6 @@ class WebViewActivity : AppCompatActivity() {
                     return@launch
                 }
 
-                // Extraction JS: only visible text nodes and visible images
                 val jsExtract = """
                 (function(){
                     function getXPath(node){
@@ -154,7 +166,6 @@ class WebViewActivity : AppCompatActivity() {
                         if(!visible(parent)) continue;
                         if(/^[\.\{\<\[\#\*]/.test(t)) continue;
                         if(t.indexOf('http') !== -1) continue;
-                        // avoid inline JSON / long attribute strings - heuristic
                         if(t.indexOf('{')!==-1 && t.indexOf('}')!==-1) continue;
                         texts.push({text:t, xpath:getXPath(parent), len:t.length});
                     }
@@ -174,63 +185,74 @@ class WebViewActivity : AppCompatActivity() {
                     hideOverlay(); return@launch
                 }
 
+                // parse extractor result
                 val clean = try { JSONArray("[$raw]").getString(0) } catch (e: Exception) { raw }
                 val jo = JSONObject(clean)
                 val texts = jo.optJSONArray("texts") ?: JSONArray()
                 val imgs = jo.optJSONArray("imgs") ?: JSONArray()
                 FileLogger.d(this@WebViewActivity, "WebViewActivity", "Found texts=${texts.length()} imgs=${imgs.length()} (top10)")
 
+                // Prepare storage for replacements
                 val twistedPairs = mutableListOf<Pair<String,String>>()
-                val textJobs = mutableListOf<Deferred<Unit>>()
-                val textScope = CoroutineScope(Dispatchers.IO + Job())
-                val toProcessTexts = minOf(10, texts.length())
-                for (i in 0 until toProcessTexts) {
-                    val tjo = texts.getJSONObject(i)
-                    val original = tjo.optString("text")
-                    val xpath = tjo.optString("xpath")
-                    val job = textScope.async {
-                        try {
-                            FileLogger.d(this@WebViewActivity, "WebViewActivity", "Sending to Mistral: ${original.take(200)}")
-                            val twisted = client.twistTextWithRetries(original, maxAttempts = 3)
-                            FileLogger.d(this@WebViewActivity, "WebViewActivity", "Mistral responded (len=${twisted.length}) example: ${twisted.take(200)}")
-                            if (twisted.isNotBlank() && twisted != original) synchronized(twistedPairs) { twistedPairs.add(Pair(xpath, twisted)) }
-                        } catch (e: Exception) {
-                            FileLogger.e(this@WebViewActivity, "WebViewActivity", "text transform failed: ${e.message}")
-                        }
-                    }
-                    textJobs.add(job)
-                }
-
                 val imgPairs = mutableListOf<Pair<String,String>>()
-                val imgJobs = mutableListOf<Deferred<Unit>>()
-                val imgScope = CoroutineScope(Dispatchers.IO + Job())
-                val toProcessImgs = minOf(10, imgs.length())
-                for (i in 0 until toProcessImgs) {
-                    val ijo = imgs.getJSONObject(i)
-                    val src = ijo.optString("src")
-                    if (src.isNullOrBlank()) continue
-                    val j = imgScope.async {
-                        try {
-                            FileLogger.d(this@WebViewActivity, "WebViewActivity", "Downloading image for face-detection: ${src.take(200)}")
-                            val transformed = client.transformImageToDataUri(src, localDarken = true)
-                            if (!transformed.isNullOrBlank() && transformed != src) {
-                                synchronized(imgPairs) { imgPairs.add(Pair(src, transformed)) }
-                                FileLogger.d(this@WebViewActivity, "WebViewActivity", "Image transformed for ${src.take(120)}")
+
+                // batch-run text transforms (batch size 3)
+                val batchSizeText = 3
+                val totalTexts = min(10, texts.length())
+                val textScope = CoroutineScope(Dispatchers.IO + Job())
+
+                withTimeoutOrNull(TRANSFORM_TIMEOUT_MS) {
+                    var i = 0
+                    while (i < totalTexts) {
+                        val end = min(i + batchSizeText, totalTexts)
+                        val batch = (i until end).map { idx ->
+                            val tjo = texts.getJSONObject(idx)
+                            val original = tjo.optString("text")
+                            val xpath = tjo.optString("xpath")
+                            textScope.async {
+                                try {
+                                    FileLogger.d(this@WebViewActivity, "WebViewActivity", "Sending to Mistral: ${original.take(200)}")
+                                    val twisted = client.twistTextWithRetries(original, maxAttempts = 3)
+                                    FileLogger.d(this@WebViewActivity, "WebViewActivity", "Mistral responded (len=${twisted.length}) example: ${twisted.take(200)}")
+                                    if (twisted.isNotBlank() && twisted != original) synchronized(twistedPairs) { twistedPairs.add(Pair(xpath, twisted)) }
+                                } catch (e: Exception) {
+                                    FileLogger.e(this@WebViewActivity, "WebViewActivity", "text transform failed: ${e.message}")
+                                }
                             }
-                        } catch (e: Exception) {
-                            FileLogger.e(this@WebViewActivity, "WebViewActivity", "Image transform failed: ${e.message}")
                         }
+                        // await this batch
+                        batch.awaitAll()
+                        i = end
                     }
-                    imgJobs.add(j)
-                }
+                    // images: batch size 4
+                    val batchSizeImg = 4
+                    val totalImgs = min(10, imgs.length())
+                    val imgScope = CoroutineScope(Dispatchers.IO + Job())
+                    var j = 0
+                    while (j < totalImgs) {
+                        val endj = min(j + batchSizeImg, totalImgs)
+                        val batchImg = (j until endj).map { idx ->
+                            val ijo = imgs.getJSONObject(idx)
+                            val src = ijo.optString("src")
+                            imgScope.async {
+                                try {
+                                    FileLogger.d(this@WebViewActivity, "WebViewActivity", "Downloading image for face-detection: ${src.take(200)}")
+                                    val transformed = client.transformImageToDataUri(src, localDarken = true)
+                                    if (!transformed.isNullOrBlank() && transformed != src) {
+                                        synchronized(imgPairs) { imgPairs.add(Pair(src, transformed)) }
+                                        FileLogger.d(this@WebViewActivity, "WebViewActivity", "Image transformed for ${src.take(120)}")
+                                    }
+                                } catch (e: Exception) {
+                                    FileLogger.e(this@WebViewActivity, "WebViewActivity", "Image transform failed: ${e.message}")
+                                }
+                            }
+                        }
+                        batchImg.awaitAll()
+                        j = endj
+                    }
+                } // end withTimeoutOrNull
 
-                val all = textJobs + imgJobs
-                try {
-                    withTimeout(18_000L) { all.awaitAll() }
-                } catch (e: TimeoutCancellationException) {
-                    FileLogger.e(this@WebViewActivity, "WebViewActivity", "Transform timeout after 18s: ${e.message}")
-                }
-
+                // Build JS replacements for whatever we have
                 val jsReplace = StringBuilder("(function(){")
                 for ((xpath, twisted) in twistedPairs) {
                     jsReplace.append("try{var n=document.evaluate('${escapeJs(xpath)}',document,null,XPathResult.FIRST_ORDERED_NODE_TYPE,null).singleNodeValue; if(n){ n.textContent = ${JSONObject.quote(twisted)}; }}catch(e){};")
@@ -240,6 +262,7 @@ class WebViewActivity : AppCompatActivity() {
                 }
                 jsReplace.append("})();")
 
+                // Apply JS even if some transforms timed out - show what's done
                 web.evaluateJavascript(jsReplace.toString(), null)
                 cache[url] = jsReplace.toString()
                 FileLogger.d(this@WebViewActivity, "WebViewActivity", "Injected replacements (texts=${twistedPairs.size}, images=${imgPairs.size})")
@@ -248,7 +271,8 @@ class WebViewActivity : AppCompatActivity() {
             } catch (e: Exception) {
                 FileLogger.e(this@WebViewActivity, "WebViewActivity", "performTransformations error: ${e.message}")
             } finally {
-                mainHandler.postDelayed({ hideOverlay() }, 350)
+                // Ensure overlay is removed after a short delay so user sees page
+                mainHandler.postDelayed({ hideOverlay() }, 300)
             }
         }
     }
