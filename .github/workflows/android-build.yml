@@ -1,4 +1,4 @@
-name: Build APK (fixed)
+name: Build APK (robust)
 
 on:
   push:
@@ -6,7 +6,7 @@ on:
   pull_request:
   workflow_dispatch:
 
-# Explicitly declare minimal permissions so the runner can read the repository and write artifacts
+# Minimal permissions to avoid unnecessary blocking
 permissions:
   contents: read
   actions: read
@@ -23,8 +23,9 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Show quick run info (debug)
+      - name: Early debug: runner & repo info
         run: |
+          echo "=== DEBUG START ==="
           echo "Date: $(date -u)"
           echo "Actor: $GITHUB_ACTOR"
           echo "Event: $GITHUB_EVENT_NAME"
@@ -33,45 +34,53 @@ jobs:
           echo "Runner temp: $RUNNER_TEMP"
           echo "---- ls workspace ----"
           ls -la
+          echo "=== DEBUG END ==="
 
-      - name: Setup JDK 17
+      - name: Setup JDK 17 (Temurin)
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: 17
 
+      - name: Cache Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
+          restore-keys: |
+            ${{ runner.os }}-gradle-
+
       - name: Ensure gradle wrapper is executable
         run: |
           if [ -f ./gradlew ]; then
             chmod +x ./gradlew
-            echo "gradlew present"
+            echo "gradlew: present"
           else
-            echo "gradlew NOT found"
+            echo "gradlew: MISSING (build may fail if repo relies on wrapper)"
           fi
 
-      - name: Install Android command line tools + SDK (platform 34, build-tools 34.0.0)
+      - name: Install Android command line tools and SDK components (platform 34)
         shell: bash
         run: |
           set -euo pipefail
 
-          # Use runner temp directory to host SDK
           SDKROOT="${RUNNER_TEMP}/android-sdk"
           mkdir -p "${SDKROOT}"
-
           echo "Using SDKROOT=${SDKROOT}"
 
-          # Prefer an sdkmanager already on PATH; otherwise download commandline tools
+          # Prefer sdkmanager on PATH if available
           if command -v sdkmanager >/dev/null 2>&1; then
             SDKMANAGER_CMD="$(command -v sdkmanager)"
           else
             cd "${RUNNER_TEMP}"
             ZIP="commandlinetools-linux.zip"
-            # stable/latest commandline tools zip from Google
             curl -fsSL "https://dl.google.com/android/repository/commandlinetools-linux-9477386_latest.zip" -o "$ZIP"
             rm -rf "${SDKROOT}/cmdline-tools"
             mkdir -p "${SDKROOT}/cmdline-tools/latest"
             unzip -q "$ZIP" -d "${SDKROOT}/cmdline-tools/latest"
-            # flatten nested folder if necessary
+            # flatten if nested
             if [ -d "${SDKROOT}/cmdline-tools/latest/cmdline-tools" ]; then
               mv "${SDKROOT}/cmdline-tools/latest/cmdline-tools/"* "${SDKROOT}/cmdline-tools/latest/" || true
               rmdir "${SDKROOT}/cmdline-tools/latest/cmdline-tools" || true
@@ -82,17 +91,17 @@ jobs:
 
           echo "sdkmanager => ${SDKMANAGER_CMD}"
 
-          # Install platform-tools, platform 34 and build-tools 34.0.0 and accept licenses
+          # Install what we need for compileSdk 34 + build-tools 34.0.0
           yes | "${SDKMANAGER_CMD}" --sdk_root="${SDKROOT}" "platform-tools" "platforms;android-34" "build-tools;34.0.0" "cmdline-tools;latest" || true
           yes | "${SDKMANAGER_CMD}" --sdk_root="${SDKROOT}" --licenses || true
 
-          # Persist ANDROID_SDK_ROOT for following steps, and add platform-tools to PATH
+          # Make available to later steps
           echo "ANDROID_SDK_ROOT=${SDKROOT}" >> "${GITHUB_ENV}"
           echo "${SDKROOT}/platform-tools" >> "${GITHUB_PATH}"
 
-          echo "Android SDK installed to ${SDKROOT}"
+          echo "Android SDK components installed to ${SDKROOT}"
 
-      - name: Print Java & Gradle versions
+      - name: Print Java & Gradle versions (for logs)
         run: |
           java -version || true
           if [ -f ./gradlew ]; then ./gradlew --version || true; fi
@@ -100,17 +109,29 @@ jobs:
       - name: Build debug APK (assembleDebug)
         run: |
           set -euo pipefail
-          # Use the wrapper if present; otherwise try gradle from PATH
           if [ -f ./gradlew ]; then
+            echo "Using gradlew wrapper"
             ./gradlew assembleDebug --stacktrace --no-daemon
           else
-            echo "gradlew missing; attempting 'gradle assembleDebug' (may fail)"
+            echo "gradlew missing, attempting system gradle (may fail)"
             gradle assembleDebug --stacktrace --no-daemon
           fi
         env:
           JAVA_TOOL_OPTIONS: "-Dfile.encoding=UTF8"
 
-      - name: Upload APK artifact (if exists)
+      - name: Show APK location or error if missing
+        run: |
+          APK="app/build/outputs/apk/debug/app-debug.apk"
+          if [ -f "$APK" ]; then
+            echo "APK built: $APK"
+            ls -la "$APK"
+          else
+            echo "APK not found at $APK. Listing app/build:"
+            ls -la app/build || true
+            exit 1
+          fi
+
+      - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
           name: twisted-apk
