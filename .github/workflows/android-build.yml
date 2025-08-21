@@ -18,11 +18,11 @@ jobs:
     timeout-minutes: 60
 
     steps:
-      - name: Checkout repository
+      - name: Checkout repository (ensure LFS)
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-
+          lfs: true
 
       - name: Setup JDK 17 (Temurin)
         uses: actions/setup-java@v4
@@ -40,22 +40,87 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-gradle-
 
-      - name: Ensure gradle wrapper is executable
+      - name: Basic repo diagnostics
         run: |
+          set -euo pipefail
+          echo "PWD: $(pwd)"
+          echo "User: $(whoami)"
+          echo "Listing repo root:"
+          ls -la .
+
+      - name: Ensure gradlew is executable and show header
+        run: |
+          set -euo pipefail
           if [ -f ./gradlew ]; then
             chmod +x ./gradlew
-            echo "gradlew: present"
+            echo "gradlew present and chmod +x applied"
           else
-            echo "gradlew: MISSING (build may fail if repo relies on wrapper)"
+            echo "WARNING: gradlew missing"
+          fi
+          echo
+          echo "gradlew first 80 lines:"
+          sed -n '1,80p' ./gradlew || true
+          file ./gradlew || true
+          ls -l ./gradlew || true
+
+      - name: Validate gradle/wrapper/gradle-wrapper.jar (critical diagnostics)
+        id: wrapper_diagnostics
+        run: |
+          set -euo pipefail
+          JAR="gradle/wrapper/gradle-wrapper.jar"
+          echo "Checking $JAR"
+          if [ ! -f "$JAR" ]; then
+            echo "MISSING" > wrapper_status.txt
+            echo "USE_WRAPPER=false" >> "$GITHUB_ENV"
+            echo "$JAR missing"
+            exit 0
           fi
 
+          echo "stat:"
+          stat -c '%n %s bytes %U %G %a' "$JAR" || true
+          echo "file output:"
+          file "$JAR" || true
+
+          echo
+          echo "Listing JAR contents (first 200 entries if present):"
+          # try jar, then unzip fallback
+          if command -v jar >/dev/null 2>&1; then
+            jar tf "$JAR" | sed -n '1,200p' || true
+          else
+            unzip -l "$JAR" | sed -n '1,200p' || true
+          fi
+
+          echo
+          echo "Check first 240 bytes (detect LFS pointer or text):"
+          head -c 240 "$JAR" | sed -n '1,240p' || true
+          echo
+
+          # Does the jar include the GradleWrapperMain class?
+          if (jar tf "$JAR" 2>/dev/null | grep -q "org/gradle/wrapper/GradleWrapperMain.class") || (unzip -l "$JAR" 2>/dev/null | grep -q "org/gradle/wrapper/GradleWrapperMain.class"); then
+            echo "FOUND_CLASS" > wrapper_status.txt
+            echo "USE_WRAPPER=true" >> "$GITHUB_ENV"
+          else
+            echo "MISSING_CLASS" > wrapper_status.txt
+            echo "USE_WRAPPER=false" >> "$GITHUB_ENV"
+          fi
+
+          echo
+          echo "Showing gradle/wrapper/gradle-wrapper.properties (if present):"
+          sed -n '1,200p' gradle/wrapper/gradle-wrapper.properties || true
+
+          echo
+          echo "Attempt to run wrapper Main class directly (will likely print usage or error):"
+          set +e
+          java -cp "$JAR" org.gradle.wrapper.GradleWrapperMain --version 2>&1 | sed -n '1,200p' || true
+          rc=$?
+          echo "Direct java -cp invocation exit code: $rc"
+          set -e
+
       - name: Install Android command line tools and SDK components (platform 34)
-        shell: bash
         run: |
           set -euo pipefail
           SDKROOT="${RUNNER_TEMP}/android-sdk"
           mkdir -p "${SDKROOT}"
-          echo "Using SDKROOT=${SDKROOT}"
           if command -v sdkmanager >/dev/null 2>&1; then
             SDKMANAGER_CMD="$(command -v sdkmanager)"
           else
@@ -72,30 +137,41 @@ jobs:
             SDKMANAGER_CMD="${SDKROOT}/cmdline-tools/latest/bin/sdkmanager"
             chmod +x "${SDKMANAGER_CMD}"
           fi
-          echo "sdkmanager => ${SDKMANAGER_CMD}"
           yes | "${SDKMANAGER_CMD}" --sdk_root="${SDKROOT}" "platform-tools" "platforms;android-34" "build-tools;34.0.0" "cmdline-tools;latest" || true
           yes | "${SDKMANAGER_CMD}" --sdk_root="${SDKROOT}" --licenses || true
           echo "ANDROID_SDK_ROOT=${SDKROOT}" >> "${GITHUB_ENV}"
           echo "${SDKROOT}/platform-tools" >> "${GITHUB_PATH}"
           echo "Android SDK components installed to ${SDKROOT}"
 
-      - name: Print Java & Gradle versions (for logs)
-        run: |
-          java -version || true
-          if [ -f ./gradlew ]; then ./gradlew --version || true; fi
-
-      - name: Build debug APK (assembleDebug)
-        run: |
-          set -euo pipefail
-          if [ -f ./gradlew ]; then
-            echo "Using gradlew wrapper"
-            ./gradlew assembleDebug --stacktrace --no-daemon
-          else
-            echo "gradlew missing, attempting system gradle (may fail)"
-            gradle assembleDebug --stacktrace --no-daemon
-          fi
+      - name: Build debug APK (use wrapper if validated, else system Gradle)
         env:
           JAVA_TOOL_OPTIONS: "-Dfile.encoding=UTF8"
+        run: |
+          set -euo pipefail
+          echo "USE_WRAPPER=${USE_WRAPPER:-false}"
+          if [ "${USE_WRAPPER:-false}" = "true" ] && [ -f ./gradlew ]; then
+            echo "Running ./gradlew assembleDebug (wrapper)"
+            chmod +x ./gradlew
+            ./gradlew assembleDebug --stacktrace --no-daemon
+          else
+            echo "Wrapper not usable. Falling back to installing system Gradle and using it (temporary)."
+            # Try SDKMAN first
+            export SDKMAN_DIR="${RUNNER_TEMP}/sdkman"
+            mkdir -p "$SDKMAN_DIR"
+            curl -s "https://get.sdkman.io" | bash
+            source "$HOME/.sdkman/bin/sdkman-init.sh" || true
+            if command -v sdk >/dev/null 2>&1; then
+              sdk install gradle 8.4 || true
+              gradle --version || true
+              gradle assembleDebug --stacktrace --no-daemon
+            else
+              # fallback to apt-get gradle (older version but usable)
+              sudo apt-get update -y
+              sudo apt-get install -y gradle
+              gradle --version || true
+              gradle assembleDebug --stacktrace --no-daemon
+            fi
+          fi
 
       - name: Show APK location or error if missing
         run: |
