@@ -85,7 +85,7 @@ class WebViewActivity : AppCompatActivity() {
 
         web.webChromeClient = object : WebChromeClient() {
             override fun onProgressChanged(view: WebView?, newProgress: Int) {
-                // keep WebView load progress in the bar (separate from warp progress)
+                // Show raw page loading progress in the progress bar
                 mainHandler.post { progressBar.progress = newProgress }
             }
         }
@@ -115,7 +115,7 @@ class WebViewActivity : AppCompatActivity() {
     /**
      * Starts the transform pipeline for the currently loaded page.
      * Shows overlay, attempts Mistral for text, falls back to local twist if needed.
-     * Also processes up to top 10 images by downloading and locally darkening faces.
+     * Also processes up to top images by downloading and locally darkening faces.
      * Ensures overlay is removed after MAX_TIMEOUT_MS.
      */
     private fun startTransform(url: String) {
@@ -158,7 +158,7 @@ class WebViewActivity : AppCompatActivity() {
 
                     replacements.add(orig to twisted)
                     done++
-                    updateProgress((done.toFloat() / totalWork.toFloat() * 100f).toInt())
+                    updateProgress(((done.toFloat() / totalWork.toFloat()) * 100f).toInt())
                 }
 
                 // apply text replacements via JS in the page (best-effort)
@@ -200,7 +200,7 @@ class WebViewActivity : AppCompatActivity() {
                         Logger.e(TAG, "image transform failed for $src: ${e.message}")
                     }
                     done++
-                    updateProgress((done.toFloat() / totalWork.toFloat() * 100f).toInt())
+                    updateProgress(((done.toFloat() / totalWork.toFloat()) * 100f).toInt())
                 }
 
             } catch (e: Exception) {
@@ -224,14 +224,18 @@ class WebViewActivity : AppCompatActivity() {
         }, MAX_TIMEOUT_MS)
     }
 
-    // update progress UI from background
-    private fun updateProgress(pct: Int) {
+    // update progress UI from background (this is the helper you were missing)
+    private fun updateProgressUI(progress: Int) {
         mainHandler.post {
+            val pct = progress.coerceIn(0, 100)
             loadingPercent.text = "$pct%"
             progressBar.progress = pct
             loadingText.text = "TWISTING — $pct%"
         }
     }
+
+    // provide a second name used earlier
+    private fun updateProgress(pct: Int) { updateProgressUI(pct) }
 
     private fun showOverlay(show: Boolean, text: String?) {
         mainHandler.post {
@@ -285,7 +289,6 @@ class WebViewActivity : AppCompatActivity() {
                         val cleaned = when (result) {
                             "null", "undefined" -> "{}"
                             else -> {
-                                // unescape Android's returned quoted string if needed
                                 if (result.length >= 2 && result.startsWith("\"") && result.endsWith("\"")) {
                                     result.substring(1, result.length - 1)
                                         .replace("\\n", "")
@@ -363,19 +366,19 @@ class WebViewActivity : AppCompatActivity() {
     private fun darkenFaces(src: android.graphics.Bitmap): android.graphics.Bitmap {
         val bmp = src.copy(android.graphics.Bitmap.Config.ARGB_8888, true)
         try {
-            val w = bmp.width
-            val h = bmp.height
+            val width = bmp.width
+            val height = bmp.height
             val canvas = android.graphics.Canvas(bmp)
             val paint = android.graphics.Paint()
             paint.isAntiAlias = true
             // Slightly bluish darken to match camera atmosphere
             paint.color = android.graphics.Color.argb(160, 10, 20, 40)
             // draw a couple of ovals based on face heuristics (upper center, lower-center)
-            val rect1 = android.graphics.RectF(w * 0.18f, h * 0.12f, w * 0.82f, h * 0.52f)
+            val rect1 = android.graphics.RectF(width * 0.18f, height * 0.12f, width * 0.82f, height * 0.52f)
             canvas.drawOval(rect1, paint)
             // small second darker patch bottom-left to create uncanny mosaic
             paint.color = android.graphics.Color.argb(110, 0, 0, 0)
-            val rect2 = android.graphics.RectF(w * 0.05f, h * 0.55f, w * 0.45f, h * 0.95f)
+            val rect2 = android.graphics.RectF(width * 0.05f, height * 0.55f, width * 0.45f, height * 0.95f)
             canvas.drawOval(rect2, paint)
         } catch (e: Exception) {
             Logger.e(TAG, "darkenFaces failed: ${e.message}")
