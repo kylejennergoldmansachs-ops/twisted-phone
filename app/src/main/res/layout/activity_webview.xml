@@ -4,14 +4,14 @@
     android:layout_width="match_parent"
     android:layout_height="match_parent">
 
-    <!-- Top URL bar -->
+    <!-- Top URL bar (use a concrete color so we don't rely on theme attributes) -->
     <LinearLayout
         android:id="@+id/topBar"
         android:orientation="horizontal"
         android:padding="8dp"
         android:layout_width="match_parent"
         android:layout_height="48dp"
-        android:background="?attr/colorSurface"
+        android:background="#DD000000"
         android:elevation="4dp">
 
         <EditText
@@ -23,7 +23,9 @@
             android:imeOptions="actionGo"
             android:inputType="textUri"
             android:hint="https://"
-            android:padding="8dp" />
+            android:padding="8dp"
+            android:textColor="#FFFFFF"
+            android:background="@android:color/transparent" />
 
         <Button
             android:id="@+id/btnGo"
