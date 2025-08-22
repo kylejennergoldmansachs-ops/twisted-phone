@@ -7,25 +7,26 @@ import android.content.Intent
 import android.os.Build
 import android.os.SystemClock
 import com.twistedphone.TwistedApp
+import com.twistedphone.util.Logger
 
 /**
- * Scheduler for periodically starting AltMessageService.
- *
- * - scheduleInitial(): schedule an inexact repeating alarm that starts AltMessageService.
- * - scheduleUnlocks(ctx): schedule an alarm to trigger AltUnlockReceiver (used by onboarding).
- * - cancel(): remove scheduled alarm.
+ * Robust scheduler: uses exact alarms only when the platform and user allow them.
+ * Provides:
+ *  - scheduleInitial()  : inexact repeating scheduler for the AltMessageService
+ *  - scheduleUnlocks(ctx): onboarding one-off unlock alarm — attempts exact scheduling when allowed
+ *  - cancel()           : cancels scheduled intents
  */
 object AltMessageScheduler {
     private const val REQUEST_CODE = 202401
-    private const val DEFAULT_INTERVAL_MS = 30L * 60L * 1000L // 30 minutes
     private const val UNLOCK_REQUEST_CODE = 202402
+    private const val DEFAULT_INTERVAL_MS = 30L * 60L * 1000L // 30 minutes
+    private const val TAG = "AltMessageScheduler"
 
     @JvmStatic
     fun scheduleInitial() {
         val ctx = TwistedApp.instance
         val am = ctx.getSystemService(Context.ALARM_SERVICE) as? AlarmManager ?: return
 
-        // Intent that starts the Service directly.
         val intent = Intent(ctx, AltMessageService::class.java)
         val flags = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M)
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
@@ -42,35 +43,65 @@ object AltMessageScheduler {
         }
 
         val startAt = SystemClock.elapsedRealtime() + 10_000L
-        // inexact repeating is battery-friendly and sufficient for message generation
-        am.setInexactRepeating(AlarmManager.ELAPSED_REALTIME_WAKEUP, startAt, interval, pi)
+        try {
+            am.setInexactRepeating(AlarmManager.ELAPSED_REALTIME_WAKEUP, startAt, interval, pi)
+        } catch (se: SecurityException) {
+            Logger.e(TAG, "scheduleInitial SecurityException: ${se.message}")
+        } catch (t: Throwable) {
+            Logger.e(TAG, "scheduleInitial failed: ${t.message}")
+        }
     }
 
     /**
-     * Schedule a single unlock alarm (used from onboarding). This mirrors the original
-     * onboarding implementation: it schedules a single broadcast to AltUnlockReceiver
-     * approximately two hours from now.
-     *
-     * Note: AltUnlockReceiver expects an "app" extra to mark a particular app unlocked.
-     * The onboarding/MainActivity code in the repo schedules a single alarm without extras;
-     * this preserves that behavior to avoid changing runtime semantics unexpectedly.
+     * Schedule a one-off "unlock" alarm roughly two hours from now.
+     * If exact alarms are allowed, use exact API; otherwise fall back to non-exact set().
      */
     @JvmStatic
     fun scheduleUnlocks(ctx: Context) {
-        val alarmMgr = ctx.getSystemService(Context.ALARM_SERVICE) as? AlarmManager ?: return
+        val am = ctx.getSystemService(Context.ALARM_SERVICE) as? AlarmManager ?: return
+
         val intent = Intent(ctx, AltUnlockReceiver::class.java)
         val flags = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M)
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         else
             PendingIntent.FLAG_UPDATE_CURRENT
 
-        val alarmIntent = PendingIntent.getBroadcast(ctx, UNLOCK_REQUEST_CODE, intent, flags)
+        val pi = PendingIntent.getBroadcast(ctx, UNLOCK_REQUEST_CODE, intent, flags)
         val triggerTime = System.currentTimeMillis() + (2 * 60 * 60 * 1000) // 2 hours
 
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-            alarmMgr.setExactAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, triggerTime, alarmIntent)
-        } else {
-            alarmMgr.setExact(AlarmManager.RTC_WAKEUP, triggerTime, alarmIntent)
+        try {
+            val canExact = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                try {
+                    am.canScheduleExactAlarms()
+                } catch (t: Throwable) {
+                    Logger.w(TAG, "canScheduleExactAlarms check failed: ${t.message}")
+                    false
+                }
+            } else {
+                true
+            }
+
+            if (canExact) {
+                // prefer exact scheduling
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                    am.setExactAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, triggerTime, pi)
+                } else {
+                    am.setExact(AlarmManager.RTC_WAKEUP, triggerTime, pi)
+                }
+            } else {
+                // fallback to non-exact scheduling (safe)
+                am.set(AlarmManager.RTC_WAKEUP, triggerTime, pi)
+            }
+        } catch (se: SecurityException) {
+            // defensive fallback: try a non-exact set() call and log
+            Logger.e(TAG, "SecurityException scheduling unlock alarm: ${se.message}")
+            try {
+                am.set(AlarmManager.RTC_WAKEUP, triggerTime, pi)
+            } catch (t: Throwable) {
+                Logger.e(TAG, "Fallback set() failed: ${t.message}")
+            }
+        } catch (t: Throwable) {
+            Logger.e(TAG, "scheduleUnlocks failed: ${t.message}")
         }
     }
 
@@ -78,23 +109,31 @@ object AltMessageScheduler {
     fun cancel() {
         val ctx = TwistedApp.instance
         val am = ctx.getSystemService(Context.ALARM_SERVICE) as? AlarmManager ?: return
+
         val intent = Intent(ctx, AltMessageService::class.java)
         val flags = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M)
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         else
             PendingIntent.FLAG_UPDATE_CURRENT
         val pi = PendingIntent.getService(ctx, REQUEST_CODE, intent, flags)
-        am.cancel(pi)
+        try {
+            am.cancel(pi)
+        } catch (t: Throwable) {
+            Logger.e(TAG, "cancel service alarm failed: ${t.message}")
+        }
         pi.cancel()
 
-        // Also cancel any unlock alarm we scheduled
         val unlockIntent = Intent(ctx, AltUnlockReceiver::class.java)
-        val unlockFlags = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M)
+        val uflags = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M)
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         else
             PendingIntent.FLAG_UPDATE_CURRENT
-        val upi = PendingIntent.getBroadcast(ctx, UNLOCK_REQUEST_CODE, unlockIntent, unlockFlags)
-        am.cancel(upi)
+        val upi = PendingIntent.getBroadcast(ctx, UNLOCK_REQUEST_CODE, unlockIntent, uflags)
+        try {
+            am.cancel(upi)
+        } catch (t: Throwable) {
+            Logger.e(TAG, "cancel unlock alarm failed: ${t.message}")
+        }
         upi.cancel()
     }
 }
