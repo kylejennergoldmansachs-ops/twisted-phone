@@ -12,7 +12,6 @@ import java.io.InputStream
 import java.util.concurrent.TimeUnit
 import java.io.FileInputStream
 import java.lang.Exception
-import java.util.concurrent.TimeUnit
 
 /**
  * Updated ModelDownloadWorker.
