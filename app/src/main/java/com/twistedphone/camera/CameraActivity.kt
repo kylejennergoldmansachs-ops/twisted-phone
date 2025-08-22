@@ -1,3 +1,4 @@
+// CameraActivity.kt (MobileSAM-enabled, runtime-adaptive)
 package com.twistedphone.camera
 
 import android.Manifest
@@ -39,26 +40,31 @@ import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.nio.channels.FileChannel
 import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 import kotlin.math.*
 
 /**
- * CameraActivity:
- * - Enhanced mode default ON
- * - Front/rear switch
- * - MiDaS depth if midas.tflite exists in filesDir/models/
- * - MobileSAM encoder/decoder detection (logged), fallback to ML Kit masks
- * - Uses a downscaled preview analysis pipeline for realtime object-aware warping
+ * CameraActivity with best-effort MobileSAM support.
+ *
+ * Behavior:
+ * - Load interpreters if files exist in filesDir/models/
+ * - When MobileSAM encoder+decoder exist, attempt to run them:
+ *     - Resize image to encoder expected size, run encoder to get embeddings
+ *     - Try to map decoder inputs by name and supply automatic grid point prompts
+ *     - If decoder run succeeds and returns mask logits -> threshold to boolean mask
+ * - If MobileSAM absent/incompatible/throws, fall back to ML Kit face+pose mask generator
  *
  * Notes:
- * - Place models into: filesDir/models/[midas.tflite, MobileSam_MobileSAMEncoder.tflite, MobileSam_MobileSAMDecoder.tflite]
- * - The activity queries TFLite input/output shapes dynamically so it works with the exact .tflite you have.
+ * - MobileSAM runtime compatibility depends on the exact tflite conversion. This code detects tensor names and shapes at runtime and is defensive.
+ * - The "automatic prompt grid" is a heuristic — it generates many candidate foreground points across the image and requests masks from the decoder; that approximates an "automatic mask generator" approach when SAM-style outputs are expected.
+ * - You should still ship quantized / device-specific TFLite builds (or use a delegate) for production performance.
  */
 class CameraActivity : AppCompatActivity() {
 
     companion object {
         private const val TAG = "CameraActivity"
-        private const val PROCESSING_MAX_WIDTH = 640        // downscale width for analysis
-        private const val MAX_ROW_SHIFT_FRACTION = 0.18f    // max horizontal row shift relative to width
+        private const val PROCESSING_MAX_WIDTH = 640
+        private const val MAX_ROW_SHIFT_FRACTION = 0.18f
     }
 
     private lateinit var previewView: PreviewView
@@ -71,7 +77,7 @@ class CameraActivity : AppCompatActivity() {
     private var cameraProvider: ProcessCameraProvider? = null
     private var lensFacing = CameraSelector.LENS_FACING_BACK
 
-    // TFLite models (optional)
+    // Optional TFLite interpreters (may be null)
     private var midasInterpreter: Interpreter? = null
     private var mobileSamEncoder: Interpreter? = null
     private var mobileSamDecoder: Interpreter? = null
@@ -90,22 +96,10 @@ class CameraActivity : AppCompatActivity() {
         PoseDetection.getClient(opts)
     }
 
-    // coroutine scope for background processing
     private val scope = CoroutineScope(Dispatchers.Default + SupervisorJob())
 
-    // last computed mask & offsets for saving captures
-    @Volatile private var lastMask: Array<BooleanArray>? = null
-    @Volatile private var lastOffsets: FloatArray? = null
-
-    // simple prefs: default enhanced ON (read preference if exists)
-    private val prefs by lazy { getSharedPreferences("twisted_prefs", MODE_PRIVATE) }
-    private val enhancedDefault: Boolean
-        get() = prefs.getBoolean("enhanced_camera", true)
-
-    private val requestPermissionLauncher =
-        registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
-            if (granted) startCamera() else Toast.makeText(this, "Camera permission required", Toast.LENGTH_SHORT).show()
-        }
+    private var lastMask: Array<BooleanArray>? = null
+    private var lastOffsets: FloatArray? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -115,7 +109,6 @@ class CameraActivity : AppCompatActivity() {
         captureButton = findViewById(R.id.btnCapture)
         switchButton = findViewById(R.id.btnToggle)
 
-        // overlay image view (draw warped frame on top of preview)
         overlayView = ImageView(this)
         overlayView.layoutParams = FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT)
         overlayView.scaleType = ImageView.ScaleType.FIT_CENTER
@@ -128,15 +121,30 @@ class CameraActivity : AppCompatActivity() {
             bindCameraUseCases()
         }
 
-        // load optional models on background thread
         scope.launch { loadModelsIfPresent() }
 
-        // check permission and start camera
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
             requestPermissionLauncher.launch(Manifest.permission.CAMERA)
         } else {
             startCamera()
         }
+    }
+
+    private val requestPermissionLauncher =
+        registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+            if (granted) startCamera() else Toast.makeText(this, "Camera permission required", Toast.LENGTH_SHORT).show()
+        }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        try {
+            midasInterpreter?.close()
+            mobileSamEncoder?.close()
+            mobileSamDecoder?.close()
+        } catch (_: Exception) {}
+        cameraExecutor.shutdown()
+        scope.cancel()
+        FileLogger.d(this, TAG, "CameraActivity destroyed")
     }
 
     private suspend fun loadModelsIfPresent() = withContext(Dispatchers.IO) {
@@ -159,11 +167,16 @@ class CameraActivity : AppCompatActivity() {
             val encFile = File(mdir, "MobileSam_MobileSAMEncoder.tflite")
             val decFile = File(mdir, "MobileSam_MobileSAMDecoder.tflite")
             if (encFile.exists() && decFile.exists()) {
-                FileLogger.d(this@CameraActivity, TAG, "MobileSAM encoder+decoder present (encoder: ${encFile.name}, decoder: ${decFile.name})")
-                // load interpreters (we don't run them blindly)
-                mobileSamEncoder = Interpreter(mapFile(encFile))
-                mobileSamDecoder = Interpreter(mapFile(decFile))
-                FileLogger.d(this@CameraActivity, TAG, "MobileSAM loaded; encoder input shape: ${mobileSamEncoder?.getInputTensor(0)?.shape()?.joinToString()}")
+                try {
+                    FileLogger.d(this@CameraActivity, TAG, "Loading MobileSAM encoder+decoder")
+                    mobileSamEncoder = Interpreter(mapFile(encFile))
+                    mobileSamDecoder = Interpreter(mapFile(decFile))
+                    FileLogger.d(this@CameraActivity, TAG, "MobileSAM interpreters loaded")
+                } catch (e: Exception) {
+                    FileLogger.e(this@CameraActivity, TAG, "Failed to load MobileSAM interpreters: ${e.message}")
+                    mobileSamEncoder = null
+                    mobileSamDecoder = null
+                }
             } else {
                 FileLogger.d(this@CameraActivity, TAG, "MobileSAM files missing or incomplete; will fallback to ML Kit masks")
             }
@@ -201,7 +214,7 @@ class CameraActivity : AppCompatActivity() {
 
         imageCapture = ImageCapture.Builder()
             .setTargetRotation(previewView.display?.rotation ?: 0)
-            .setTargetResolution(Size(1280, 720))
+            .setTargetResolution(Size(2048, 1536))
             .build()
 
         val analysis = ImageAnalysis.Builder()
@@ -225,228 +238,283 @@ class CameraActivity : AppCompatActivity() {
         }
     }
 
-    private fun analyzeFrame(proxy: ImageProxy) {
-        val mediaImage = proxy.image ?: run { proxy.close(); return }
-        // convert to downscaled bitmap for analysis
-        val bitmap = imageToBitmap(mediaImage, proxy.imageInfo.rotationDegrees, PROCESSING_MAX_WIDTH)
+    // ----------------- Analyzer and Mask logic -----------------
+
+    private fun analyzeFrame(imageProxy: ImageProxy) {
+        val bitmap = imageProxyToBitmap(imageProxy)
         if (bitmap == null) {
-            proxy.close(); return
+            imageProxy.close()
+            return
         }
 
         scope.launch {
-            try {
-                // Depth: MiDaS if present else luminance fallback
-                val depth = if (midasInterpreter != null) {
-                    runMiDaS(bitmap)
-                } else {
-                    luminanceDepthApprox(bitmap)
-                }
-
-                // Mask: try MobileSAM (not fully wired here) -> fallback to ML Kit face/pose rectangles
-                val mask = runMaskFallback(bitmap)
-
-                // Compute offsets from depth
-                val offsets = computeRowOffsetsFromDepth(depth, bitmap.width, bitmap.height)
-
-                // Keep last for capture
-                lastMask = mask
-                lastOffsets = offsets
-
-                // Warp and recolor
-                val warped = warpBitmap(bitmap, offsets, mask)
-                val final = applyAtmosphere(warped, mask, enhancedDefault)
-
-                withContext(Dispatchers.Main) {
-                    try { overlayView.setImageBitmap(final) } catch (e: Exception) { FileLogger.e(this@CameraActivity, TAG, "UI setImage failed: ${e.message}") }
-                }
+            // First: try MobileSAM path if interpreters present
+            val maskFromSam = try {
+                runMobileSamIfAvailable(bitmap)
             } catch (e: Exception) {
-                FileLogger.e(this@CameraActivity, TAG, "Frame processing error: ${e.message}")
-            } finally {
-                proxy.close()
+                FileLogger.e(this@CameraActivity, TAG, "MobileSAM run exception: ${e.message}")
+                null
             }
+
+            val mask = maskFromSam ?: runMaskFallback(bitmap)
+
+            val offsets = computeRowOffsets(mask)
+            lastMask = mask
+            lastOffsets = offsets
+
+            val warped = createWarpedBitmap(bitmap, offsets)
+            withContext(Dispatchers.Main) {
+                overlayView.setImageBitmap(warped)
+            }
+            imageProxy.close()
         }
     }
 
-    // Convert Image (YUV_420_888) to downscaled ARGB bitmap
-    private fun imageToBitmap(image: android.media.Image, rotation: Int, maxWidth: Int): Bitmap? {
-        return try {
-            val y = image.planes[0].buffer
-            val u = image.planes[1].buffer
-            val v = image.planes[2].buffer
-            val ySize = y.remaining()
-            val uSize = u.remaining()
-            val vSize = v.remaining()
-            val nv21 = ByteArray(ySize + uSize + vSize)
-            y.get(nv21, 0, ySize)
-            v.get(nv21, ySize, vSize)
-            u.get(nv21, ySize + vSize, uSize)
-            val yuv = android.graphics.YuvImage(nv21, android.graphics.ImageFormat.NV21, image.width, image.height, null)
-            val baos = java.io.ByteArrayOutputStream()
-            yuv.compressToJpeg(android.graphics.Rect(0, 0, image.width, image.height), 80, baos)
-            val bytes = baos.toByteArray()
-            var bmp = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
-            if (rotation != 0) {
-                val matrix = Matrix(); matrix.postRotate(rotation.toFloat())
-                bmp = Bitmap.createBitmap(bmp, 0, 0, bmp.width, bmp.height, matrix, true)
-            }
-            if (bmp.width > maxWidth) {
-                val newH = (bmp.height.toFloat() * maxWidth / bmp.width).toInt()
-                bmp = Bitmap.createScaledBitmap(bmp, maxWidth, newH, true)
-            }
-            bmp
-        } catch (e: Exception) {
-            FileLogger.e(this, TAG, "imageToBitmap failed: ${e.message}")
-            null
-        }
-    }
+    // Convert ImageProxy to a downscaled ARGB bitmap (luma-based)
+    private fun imageProxyToBitmap(imageProxy: ImageProxy): Bitmap? {
+        val plane = imageProxy.planes.firstOrNull() ?: return null
+        val buffer = plane.buffer ?: return null
 
-    // Run MiDaS dynamically by querying input/output tensor shapes
-    private suspend fun runMiDaS(bmp: Bitmap): FloatArray = withContext(Dispatchers.Default) {
-        val interp = midasInterpreter ?: return@withContext luminanceDepthApprox(bmp)
         try {
-            val inputTensor = interp.getInputTensor(0)
-            val inputShape = inputTensor.shape() // e.g. [1, h, w, 3] or [1,3,h,w]
-            val inputDims = inputShape.toList()
-            FileLogger.d(this@CameraActivity, TAG, "MiDaS input shape: ${inputShape.joinToString()}")
-            // choose width/height from shape
-            val (modelW, modelH) = when {
-                inputShape.size == 4 && inputShape[1] == 3 -> Pair(inputShape[3], inputShape[2])  // [1,3,h,w]
-                inputShape.size == 4 && inputShape[3] == 3 -> Pair(inputShape[2], inputShape[1])  // [1,h,w,3]
-                inputShape.size == 3 -> Pair(inputShape[2], inputShape[1])
-                else -> Pair(256, 256)
-            }
-            // prepare input buffer float32
-            val resized = Bitmap.createScaledBitmap(bmp, modelW, modelH, true)
-            val inBuf = ByteBuffer.allocateDirect(4 * modelW * modelH * 3).order(ByteOrder.nativeOrder())
-            inBuf.rewind()
-            val px = IntArray(modelW * modelH)
-            resized.getPixels(px, 0, modelW, 0, 0, modelW, modelH)
-            // normalization heuristic: scale to [0,1]
-            for (i in px.indices) {
-                val c = px[i]
-                inBuf.putFloat(((c shr 16) and 0xFF) / 255f)
-                inBuf.putFloat(((c shr 8) and 0xFF) / 255f)
-                inBuf.putFloat((c and 0xFF) / 255f)
-            }
-            inBuf.rewind()
+            val width = imageProxy.width
+            val height = imageProxy.height
+            val ySize = buffer.remaining()
+            val y = ByteArray(ySize)
+            buffer.get(y, 0, ySize)
 
-            // create output object matching output shape dynamically
-            val outShape = interp.getOutputTensor(0).shape() // e.g. [1, h, w, 1] or [1, h, w]
-            FileLogger.d(this@CameraActivity, TAG, "MiDaS output shape: ${outShape.joinToString()}")
-            val output = createFloatArrayForShape(outShape)
-
-            // Run inference
-            interp.run(inBuf, output)
-            // flatten output to target w*h
-            val outW: Int
-            val outH: Int
-            if (outShape.size >= 3) {
-                outH = outShape[outShape.size - 3]
-                outW = outShape[outShape.size - 2]
-            } else {
-                outH = modelH; outW = modelW
+            val bmp = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+            val pixels = IntArray(width * height)
+            for (i in 0 until width * height) {
+                val v = y.getOrNull(i)?.toInt() ?: 0
+                val vv = (v and 0xFF)
+                val col = (0xFF shl 24) or (vv shl 16) or (vv shl 8) or vv
+                pixels[i] = col
             }
-            // Pull data into FloatArray of length bmp.width*bmp.height
-            val depthArr = FloatArray(bmp.width * bmp.height)
-            // extract from nested arrays
-            val tmp2d = extract2DFloatArray(output)
-            // upsample/resize to bmp dims (nearest neighbor)
-            for (y in 0 until bmp.height) {
-                val ry = (y.toFloat() * tmp2d.size / bmp.height).toInt().coerceIn(0, tmp2d.size - 1)
-                val row = tmp2d[ry]
-                for (x in 0 until bmp.width) {
-                    val rx = (x.toFloat() * row.size / bmp.width).toInt().coerceIn(0, row.size - 1)
-                    // normalize heuristically to [0,1]
-                    val v = row[rx]
-                    depthArr[y * bmp.width + x] = v.toFloat()
+            bmp.setPixels(pixels, 0, width, 0, 0, width, height)
+
+            val targetW = PROCESSING_MAX_WIDTH
+            val targetH = (height.toFloat() / width * targetW).toInt()
+            val scaled = Bitmap.createScaledBitmap(bmp, targetW, targetH, true)
+            bmp.recycle()
+            return scaled
+        } catch (e: Exception) {
+            FileLogger.e(this, TAG, "imageProxy->bitmap conversion failed: ${e.message}")
+            return null
+        }
+    }
+
+    /**
+     * Attempt to run MobileSAM using TFLite interpreters if available.
+     * Returns boolean mask (h x w) or null if MobileSAM is unavailable / incompatible / failed.
+     *
+     * The method:
+     *  - queries encoder input shape and resizes the bitmap accordingly
+     *  - runs encoder -> embeddings
+     *  - inspects decoder input tensor names and tries to map them:
+     *      image_embeddings, point_coords, point_labels, mask_input, has_mask_input, orig_im_size
+     *  - supplies a grid of points as prompts (automatic mask generation heuristic)
+     */
+    private suspend fun runMobileSamIfAvailable(bmp: Bitmap): Array<BooleanArray>? = withContext(Dispatchers.Default) {
+        val enc = mobileSamEncoder
+        val dec = mobileSamDecoder
+        if (enc == null || dec == null) return@withContext null
+
+        try {
+            // 1) encoder input shape
+            val encIn0 = enc.getInputTensor(0)
+            val encShape = encIn0.shape() // e.g., [1, H, W, 3] (commonly)
+            if (encShape.size < 3) {
+                FileLogger.d(this@CameraActivity, TAG, "Unexpected encoder input shape: ${encShape.joinToString()}")
+                return@withContext null
+            }
+
+            val targetH = encShape[1]
+            val targetW = encShape[2]
+            // prepare float32 NHWC normalized input
+            val encInput = bitmapToFloatArrayNHWC(bmp, targetW, targetH)
+
+            // prepare encoder output buffer using output tensor shape
+            val encOutTensor = enc.getOutputTensor(0)
+            val encOutShape = encOutTensor.shape() // e.g., [1, Henc, Wenc, C]
+            val encOutSize = encOutShape.fold(1) { a, b -> a * b }
+            val encOutBuffer = FloatArray(encOutSize)
+
+            // run encoder
+            try {
+                enc.run(encInput, encOutBuffer)
+            } catch (e: Exception) {
+                FileLogger.e(this@CameraActivity, TAG, "Encoder run failed: ${e.message}")
+                return@withContext null
+            }
+
+            // 2) prepare decoder inputs by inspecting decoder tensors
+            val decInputCount = dec.inputTensorCount
+            val decInputNameToIndex = mutableMapOf<String, Int>()
+            for (i in 0 until decInputCount) {
+                try {
+                    val n = dec.getInputTensor(i).name.lowercase()
+                    decInputNameToIndex[n] = i
+                } catch (e: Exception) {
+                    // ignore tensor name read failures
                 }
             }
-            FileLogger.d(this@CameraActivity, TAG, "MiDaS inference completed (approx)")
-            return@withContext depthArr
-        } catch (e: Exception) {
-            FileLogger.e(this@CameraActivity, TAG, "MiDaS inference error: ${e.message}")
-            return@withContext luminanceDepthApprox(bmp)
-        }
-    }
 
-    // Helper: create nested float arrays based on shape (max 4D supported)
-    private fun createFloatArrayForShape(shape: IntArray): Any {
-        return when (shape.size) {
-            1 -> FloatArray(shape[0])
-            2 -> Array(shape[0]) { FloatArray(shape[1]) }
-            3 -> Array(shape[0]) { Array(shape[1]) { FloatArray(shape[2]) } }
-            4 -> Array(shape[0]) { Array(shape[1]) { Array(shape[2]) { FloatArray(shape[3]) } } }
-            else -> FloatArray(shape.fold(1) { a, b -> a * b })
-        }
-    }
+            // heuristic: find likely indices
+            fun findIndexByContains(vararg keys: String): Int? {
+                for ((name, idx) in decInputNameToIndex) {
+                    for (k in keys) if (name.contains(k)) return idx
+                }
+                return null
+            }
 
-    // Helper: extract 2D float array if output is nested arrays of floats
-    private fun extract2DFloatArray(obj: Any): Array<FloatArray> {
-        return try {
-            when (obj) {
-                is FloatArray -> arrayOf(obj)
-                is Array<*> -> {
-                    // try to flatten to Array<FloatArray>
-                    val outer = obj as Array<*>
-                    if (outer.isEmpty()) return arrayOf()
-                    // if outer elements are FloatArray
-                    return if (outer[0] is FloatArray) {
-                        @Suppress("UNCHECKED_CAST")
-                        outer as Array<FloatArray>
-                    } else if (outer[0] is Array<*>) {
-                        // take first two dims
-                        val h = outer.size
-                        val w = (outer[0] as Array<*>).size
-                        val out = Array(h) { FloatArray(w) }
-                        for (i in 0 until h) {
-                            val rowObj = outer[i] as Array<*>
-                            for (j in 0 until w) {
-                                val valAny = rowObj[j]
-                                out[i][j] = when (valAny) {
-                                    is Float -> valAny
-                                    is Double -> valAny.toFloat()
-                                    is Number -> valAny.toFloat()
-                                    else -> 0f
-                                }
-                            }
-                        }
-                        out
-                    } else {
-                        arrayOf()
+            val idxImageEmb = findIndexByContains("image_emb", "image_embedding", "image_embeddings", "img_emb")
+            val idxPointCoords = findIndexByContains("point", "point_coords", "points", "prompt_point")
+            val idxPointLabels = findIndexByContains("label", "point_labels", "pointlabel", "point_label")
+            val idxMaskInput = findIndexByContains("mask_input", "mask_in", "prev_mask")
+            val idxHasMask = findIndexByContains("has_mask", "has_mask_input")
+            val idxOrigSize = findIndexByContains("orig", "orig_image", "image_size", "input_size")
+
+            if (idxImageEmb == null) {
+                FileLogger.d(this@CameraActivity, TAG, "Decoder does not expose an image_embeddings input we can find. Names: ${decInputNameToIndex.keys}")
+                return@withContext null
+            }
+
+            // 3) build automatic prompt grid (center of tiles)
+            val gridCols = 6
+            val gridRows = 4
+            val points = mutableListOf<Pair<Float, Float>>()
+            for (r in 0 until gridRows) {
+                for (c in 0 until gridCols) {
+                    val x = (c + 0.5f) / gridCols.toFloat()
+                    val y = (r + 0.5f) / gridRows.toFloat()
+                    points.add(x to y)
+                }
+            }
+            val numPoints = points.size
+
+            // point coords shape often [1, num_points, 2]
+            val pointCoords = FloatArray(1 * numPoints * 2)
+            for (i in 0 until numPoints) {
+                pointCoords[i * 2 + 0] = points[i].first
+                pointCoords[i * 2 + 1] = points[i].second
+            }
+            // labels: 1 for foreground
+            val pointLabels = IntArray(1 * numPoints) { 1 }
+
+            // 4) prepare inputs array for decoder in index order (object array of length decInputCount)
+            val decInputs = arrayOfNulls<Any>(decInputCount)
+            // fill image_embeddings: TFLite typically expects flattened float array matching enc output shape
+            decInputs[idxImageEmb] = encOutBuffer
+
+            if (idxPointCoords != null) decInputs[idxPointCoords] = pointCoords
+            if (idxPointLabels != null) decInputs[idxPointLabels] = pointLabels
+            if (idxMaskInput != null) decInputs[idxMaskInput] = FloatArray(1) // zero mask
+            if (idxHasMask != null) decInputs[idxHasMask] = IntArray(1) { 0 }
+            if (idxOrigSize != null) {
+                // decoder sometimes wants [1,2] of H,W (original image). Put processing bitmap size (w,h)
+                decInputs[idxOrigSize] = intArrayOf(bmp.height, bmp.width)
+            }
+
+            // 5) prepare expected outputs: try to get first output shape and allocate buffer
+            val decOutCount = dec.outputTensorCount
+            if (decOutCount <= 0) {
+                FileLogger.d(this@CameraActivity, TAG, "Decoder has no outputs? count=0")
+                return@withContext null
+            }
+            val outShape = dec.getOutputTensor(0).shape() // e.g., [1,1,Hmask,Wmask] or [1,Hmask,Wmask]
+            val outSize = outShape.fold(1) { a, b -> a * b }
+            val decOutBuffer = FloatArray(outSize)
+            val outputs = mutableMapOf<Int, Any>()
+            outputs[0] = decOutBuffer
+
+            // 6) run decoder
+            try {
+                dec.runForMultipleInputsOutputs(decInputs, outputs)
+            } catch (e: Exception) {
+                FileLogger.e(this@CameraActivity, TAG, "Decoder run failed: ${e.message}")
+                return@withContext null
+            }
+
+            // 7) interpret decoder output -> produce boolean mask sized to output HxW (or upscale to bmp size)
+            val maskH: Int
+            val maskW: Int
+            if (outShape.size == 4) {
+                // [1,1,H,W] or [1,C,H,W]
+                maskH = outShape[2]
+                maskW = outShape[3]
+            } else if (outShape.size == 3) {
+                maskH = outShape[1]
+                maskW = outShape[2]
+            } else {
+                FileLogger.d(this@CameraActivity, TAG, "Unexpected decoder output shape: ${outShape.joinToString()}")
+                return@withContext null
+            }
+
+            val mask = Array(maskH) { BooleanArray(maskW) }
+            val flat = decOutBuffer
+            // assume single-channel logits; threshold at 0.0 (logit) or 0.5 (prob) — defensively compute sigmoid
+            for (y in 0 until maskH) {
+                for (x in 0 until maskW) {
+                    val idx = y * maskW + x
+                    val v = flat.getOrNull(idx) ?: 0f
+                    val prob = 1f / (1f + kotlin.math.exp(-v))
+                    mask[y][x] = prob >= 0.5f
+                }
+            }
+
+            // if mask resolution != bmp resolution, upscale mask to bmp resolution
+            if (maskW != bmp.width || maskH != bmp.height) {
+                val up = Array(bmp.height) { BooleanArray(bmp.width) }
+                for (yy in 0 until bmp.height) {
+                    val sy = (yy.toFloat() / bmp.height.toFloat()) * maskH.toFloat()
+                    val iy = sy.toInt().coerceIn(0, maskH - 1)
+                    for (xx in 0 until bmp.width) {
+                        val sx = (xx.toFloat() / bmp.width.toFloat()) * maskW.toFloat()
+                        val ix = sx.toInt().coerceIn(0, maskW - 1)
+                        up[yy][xx] = mask[iy][ix]
                     }
                 }
-                else -> arrayOf()
+                return@withContext up
             }
+
+            return@withContext mask
         } catch (e: Exception) {
-            FileLogger.e(this, TAG, "extract2DFloatArray failed: ${e.message}")
-            arrayOf()
+            FileLogger.e(this@CameraActivity, TAG, "runMobileSamIfAvailable exception: ${e.message}")
+            return@withContext null
         }
     }
 
-    // Fallback simple depth estimate from luminance (faster and reliable)
-    private fun luminanceDepthApprox(bmp: Bitmap): FloatArray {
-        val w = bmp.width; val h = bmp.height
-        val arr = FloatArray(w * h)
-        val pixels = IntArray(w * h)
-        bmp.getPixels(pixels, 0, w, 0, 0, w, h)
-        for (i in pixels.indices) {
-            val c = pixels[i]
-            val lum = (0.299f * ((c shr 16) and 0xFF) + 0.587f * ((c shr 8) and 0xFF) + 0.114f * (c and 0xFF)) / 255f
-            arr[i] = (1f - lum).coerceIn(0f, 1f)
+    // helper: convert a Bitmap (any size) into an NHWC float array for TFLite (normalized 0..1)
+    private fun bitmapToFloatArrayNHWC(src: Bitmap, targetW: Int, targetH: Int): FloatArray {
+        val scaled = Bitmap.createScaledBitmap(src, targetW, targetH, true)
+        val pixels = IntArray(targetW * targetH)
+        scaled.getPixels(pixels, 0, targetW, 0, 0, targetW, targetH)
+        val floats = FloatArray(1 * targetH * targetW * 3)
+        var idx = 0
+        for (y in 0 until targetH) {
+            for (x in 0 until targetW) {
+                val p = pixels[y * targetW + x]
+                // extract RGB and normalize to [0,1]
+                floats[idx++] = ((p shr 16) and 0xFF) / 255f
+                floats[idx++] = ((p shr 8) and 0xFF) / 255f
+                floats[idx++] = (p and 0xFF) / 255f
+            }
         }
-        return arr
+        scaled.recycle()
+        return floats
     }
 
-    // Mask generation: if MobileSAM present, we could use it; for now fallback to ML Kit face/pose boxes
+    /**
+     * ML Kit fallback mask (faces + pose)
+     */
     private suspend fun runMaskFallback(bmp: Bitmap): Array<BooleanArray> = withContext(Dispatchers.Default) {
         try {
             val w = bmp.width; val h = bmp.height
             val mask = Array(h) { BooleanArray(w) }
             val input = InputImage.fromBitmap(bmp, 0)
 
-            // Faces
             val facesTask: Task<List<Face>> = faceDetector.process(input)
-            val faces = try { Tasks.await(facesTask, 500) } catch (e: Exception) {
+            val faces = try { Tasks.await(facesTask, 500, TimeUnit.MILLISECONDS) } catch (e: Exception) {
                 FileLogger.d(this@CameraActivity, TAG, "faceTask failed: ${e.message}"); emptyList<Face>()
             }
             for (f in faces) {
@@ -458,10 +526,9 @@ class CameraActivity : AppCompatActivity() {
                 }
             }
 
-            // Pose keypoints -> mask wrists/head
             try {
                 val poseTask = poseDetector.process(input)
-                val poses = try { Tasks.await(poseTask, 500) } catch (e: Exception) { emptyList<Pose>() }
+                val poses = try { Tasks.await(poseTask, 500, TimeUnit.MILLISECONDS) } catch (e: Exception) { emptyList<Pose>() }
                 for (p in poses) {
                     val keypoints = listOfNotNull(
                         p.getPoseLandmark(com.google.mlkit.vision.pose.PoseLandmark.NOSE),
@@ -484,207 +551,93 @@ class CameraActivity : AppCompatActivity() {
             return@withContext mask
         } catch (e: Exception) {
             FileLogger.e(this@CameraActivity, TAG, "runMaskFallback error: ${e.message}")
-            // return empty mask on failure
             return@withContext Array(bmp.height) { BooleanArray(bmp.width) }
         }
     }
 
-    // Compute horizontal row offsets (parallax) from a depth array length w*h
-    private fun computeRowOffsetsFromDepth(depth: FloatArray, w: Int, h: Int): FloatArray {
-        try {
-            val rowAvg = FloatArray(h)
-            for (y in 0 until h) {
-                var sum = 0f
-                for (x in 0 until w) sum += depth[y * w + x]
-                rowAvg[y] = sum / w
-            }
-            val minv = rowAvg.minOrNull() ?: 0f
-            val maxv = rowAvg.maxOrNull() ?: 1f
-            val rng = (maxv - minv).let { if (it <= 1e-6f) 1f else it }
-            val maxShift = w * MAX_ROW_SHIFT_FRACTION
-            val offsets = FloatArray(h)
-            for (y in 0 until h) {
-                val norm = (rowAvg[y] - minv) / rng
-                offsets[y] = (norm * 2f - 1f) * maxShift // near -> negative, far -> positive
-            }
-            return offsets
-        } catch (e: Exception) {
-            FileLogger.e(this, TAG, "computeRowOffsetsFromDepth error: ${e.message}")
-            return FloatArray(h) { 0f }
-        }
-    }
+    private fun computeRowOffsets(mask: Array<BooleanArray>): FloatArray {
+        val h = mask.size
+        val w = if (h > 0) mask[0].size else 0
+        val offsets = FloatArray(h)
+        if (h == 0 || w == 0) return offsets
 
-    // Warp only inside masked pixels: shift masked pixels by row offset
-    private fun warpBitmap(src: Bitmap, offsets: FloatArray, mask: Array<BooleanArray>?): Bitmap {
-        val w = src.width; val h = src.height
-        val out = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
-        val rowPixels = IntArray(w)
         for (y in 0 until h) {
-            src.getPixels(rowPixels, 0, w, 0, y, w, 1)
-            val outRow = IntArray(w)
-            val shift = if (y < offsets.size) offsets[y].toInt() else 0
-            if (mask == null) {
-                // global warp
-                for (x in 0 until w) outRow[x] = rowPixels[(x - shift).coerceIn(0, w - 1)]
-            } else {
-                val rowMask = mask.getOrNull(y)
-                if (rowMask == null) {
-                    for (x in 0 until w) outRow[x] = rowPixels[(x - shift).coerceIn(0, w - 1)]
-                } else {
-                    for (x in 0 until w) outRow[x] = if (rowMask[x]) rowPixels[(x - shift).coerceIn(0, w - 1)] else rowPixels[x]
-                }
-            }
-            out.setPixels(outRow, 0, w, 0, y, w, 1)
+            var count = 0
+            for (x in 0 until w) if (mask[y][x]) count++
+            val frac = count.toFloat() / w.toFloat()
+            offsets[y] = (MAX_ROW_SHIFT_FRACTION * frac * frac) * w
         }
-        return out
+
+        val smoothed = FloatArray(h)
+        val radius = 6
+        for (y in 0 until h) {
+            var sum = 0f
+            var norm = 0f
+            for (k in -radius..radius) {
+                val yy = (y + k).coerceIn(0, h - 1)
+                val wght = (1.0f / (1 + kotlin.math.abs(k))).toFloat()
+                sum += offsets[yy] * wght
+                norm += wght
+            }
+            smoothed[y] = sum / norm
+        }
+        return smoothed
     }
 
-    // Darker + slight blue atmosphere; selective chromatic doubling for masked rects
-    private fun applyAtmosphere(src: Bitmap, mask: Array<BooleanArray>?, enhanced: Boolean): Bitmap {
+    private fun createWarpedBitmap(src: Bitmap, offsets: FloatArray): Bitmap {
         val w = src.width; val h = src.height
         val out = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
         val canvas = Canvas(out)
-        val paint = Paint(Paint.ANTI_ALIAS_FLAG)
-        val contrast = if (enhanced) 1.07f else 1.03f
-        val brighten = if (enhanced) -22f else -8f
-        val cm = ColorMatrix(floatArrayOf(
-            contrast,0f,0f,0f,brighten,
-            0f,contrast,0f,0f,brighten,
-            0f,0f,contrast,0f,brighten-8f,
-            0f,0f,0f,1f,0f
-        ))
-        val blueTint = ColorMatrix(); blueTint.setScale(0.95f,0.96f,1.06f,1f)
-        cm.postConcat(blueTint)
-        paint.colorFilter = ColorMatrixColorFilter(cm)
-        canvas.drawBitmap(src, 0f, 0f, paint)
+        val paint = Paint(Paint.FILTER_BITMAP_FLAG)
+        val srcRect = Rect(0, 0, w, 1)
+        val dstRect = Rect(0, 0, w, 1)
 
-        if (mask != null) {
-            // bounding boxes from mask (connected components)
-            val rects = maskBoundingBoxes(mask)
-            val redPaint = Paint(); redPaint.isFilterBitmap = true
-            redPaint.colorFilter = PorterDuffColorFilter(Color.argb(if (enhanced) 120 else 80, 255, 0, 0), PorterDuff.Mode.SRC_ATOP)
-            val bluePaint = Paint(); bluePaint.isFilterBitmap = true
-            bluePaint.colorFilter = PorterDuffColorFilter(Color.argb(if (enhanced) 90 else 60, 0, 0, 255), PorterDuff.Mode.SRC_ATOP)
-            val shift = if (enhanced) 6 else 3
-            for (r in rects) {
-                try {
-                    val srcRect = Rect(r.left, r.top, r.right, r.bottom)
-                    val dstR = Rect(r.left + shift, r.top, r.right + shift, r.bottom)
-                    val dstB = Rect(r.left - shift, r.top, r.right - shift, r.bottom)
-                    canvas.drawBitmap(src, srcRect, dstR, redPaint)
-                    canvas.drawBitmap(src, srcRect, dstB, bluePaint)
-                } catch (_: Exception) {}
-            }
+        for (y in 0 until h) {
+            val rowOffset = offsets.getOrNull(y) ?: 0f
+            val shift = rowOffset.toInt()
+            srcRect.top = y; srcRect.bottom = y + 1
+            val left = shift.coerceAtLeast(-w)
+            dstRect.left = left
+            dstRect.top = y
+            dstRect.right = left + w
+            dstRect.bottom = y + 1
+            canvas.drawBitmap(src, srcRect, dstRect, paint)
         }
+
         return out
     }
 
-    // Simple connected components -> bounding rectangles
-    private fun maskBoundingBoxes(mask: Array<BooleanArray>): List<Rect> {
-        val h = mask.size
-        if (h == 0) return emptyList()
-        val w = mask[0].size
-        val visited = Array(h) { BooleanArray(w) }
-        val rects = mutableListOf<Rect>()
-        for (y in 0 until h) {
-            for (x in 0 until w) {
-                if (!visited[y][x] && mask[y][x]) {
-                    var minX = x; var minY = y; var maxX = x; var maxY = y
-                    val q = ArrayDeque<Pair<Int,Int>>()
-                    q.add(Pair(x,y)); visited[y][x] = true
-                    while (q.isNotEmpty()) {
-                        val (cx, cy) = q.removeFirst()
-                        minX = min(minX, cx); minY = min(minY, cy)
-                        maxX = max(maxX, cx); maxY = max(maxY, cy)
-                        for (dy in -1..1) for (dx in -1..1) {
-                            val nx = cx + dx; val ny = cy + dy
-                            if (nx in 0 until w && ny in 0 until h && !visited[ny][nx] && mask[ny][nx]) {
-                                visited[ny][nx] = true
-                                q.add(Pair(nx, ny))
-                            }
-                        }
-                    }
-                    rects.add(Rect(minX, minY, maxX+1, maxY+1))
-                }
-            }
-        }
-        return rects
-    }
-
-    // Capture pipeline: use last computed mask+offsets to produce final warped saved image
     private fun takePicture() {
-        val ic = imageCapture ?: return
-        val ts = System.currentTimeMillis()
-        val displayName = "twisted_${ts}.jpg"
-        val values = ContentValues().apply {
-            put(MediaStore.Images.Media.DISPLAY_NAME, displayName)
-            put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) put(MediaStore.Images.Media.RELATIVE_PATH, "Pictures/TwistedPhone")
-        }
-        val resolver = contentResolver
-        val uri: Uri = resolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values) ?: run {
-            Toast.makeText(this, "Cannot create media entry", Toast.LENGTH_SHORT).show()
+        val ic = imageCapture ?: run {
+            Toast.makeText(this, "Capture not ready", Toast.LENGTH_SHORT).show()
             return
         }
 
-        ic.takePicture(ContextCompat.getMainExecutor(this), object: ImageCapture.OnImageCapturedCallback() {
-            override fun onCaptureSuccess(proxy: ImageProxy) {
-                scope.launch {
-                    try {
-                        val mediaImage = proxy.image
-                        if (mediaImage != null) {
-                            var bmp = imageToBitmap(mediaImage, proxy.imageInfo.rotationDegrees, maxWidth = mediaImage.width)
-                            if (bmp == null) {
-                                bmp = Bitmap.createBitmap(1280, 720, Bitmap.Config.ARGB_8888)
-                            }
-                            // compute depth for full-res using MiDaS if available (downscale for speed)
-                            val small = Bitmap.createScaledBitmap(bmp, PROCESSING_MAX_WIDTH, (PROCESSING_MAX_WIDTH * bmp.height / bmp.width), true)
-                            val depth = if (midasInterpreter != null) runMiDaS(small) else luminanceDepthApprox(small)
-                            val offsets = computeRowOffsetsFromDepth(depth, small.width, small.height)
-                            // upscale offsets to full height (nearest)
-                            val scaledOffsets = FloatArray(bmp.height)
-                            for (y in 0 until bmp.height) {
-                                val ry = (y.toFloat() * small.height / bmp.height).toInt().coerceIn(0, small.height - 1)
-                                scaledOffsets[y] = offsets[ry] * (bmp.width.toFloat() / small.width.toFloat())
-                            }
-                            val mask = lastMask ?: Array(small.height) { BooleanArray(small.width) }
-                            // scale mask to full-res (naive nearest)
-                            val fullMask = Array(bmp.height) { BooleanArray(bmp.width) }
-                            for (y in 0 until bmp.height) {
-                                val ry = (y.toFloat() * small.height / bmp.height).toInt().coerceIn(0, small.height - 1)
-                                for (x in 0 until bmp.width) {
-                                    val rx = (x.toFloat() * small.width / bmp.width).toInt().coerceIn(0, small.width - 1)
-                                    fullMask[y][x] = mask[ry][rx]
-                                }
-                            }
-                            val warped = warpBitmap(bmp, scaledOffsets, fullMask)
-                            val final = applyAtmosphere(warped, fullMask, enhancedDefault)
-                            resolver.openOutputStream(uri)?.use { os -> final.compress(Bitmap.CompressFormat.JPEG, 90, os) }
-                            FileLogger.d(this@CameraActivity, TAG, "Saved warped image to $uri")
-                            withContext(Dispatchers.Main) { Toast.makeText(this@CameraActivity, "Saved capture", Toast.LENGTH_SHORT).show() }
-                        }
-                    } catch (e: Exception) {
-                        FileLogger.e(this@CameraActivity, TAG, "Capture processing error: ${e.message}")
-                    } finally {
-                        proxy.close()
-                    }
-                }
+        val name = "twisted_${System.currentTimeMillis()}"
+        val contentValues = ContentValues().apply {
+            put(MediaStore.MediaColumns.DISPLAY_NAME, name)
+            put(MediaStore.MediaColumns.MIME_TYPE, "image/jpeg")
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                put(MediaStore.Images.Media.RELATIVE_PATH, "Pictures/TwistedPhone")
             }
+        }
+        val outputOptions = ImageCapture.OutputFileOptions
+            .Builder(contentResolver,
+                MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
+                contentValues)
+            .build()
+
+        ic.takePicture(outputOptions, ContextCompat.getMainExecutor(this), object : ImageCapture.OnImageSavedCallback {
+            override fun onImageSaved(outputFileResults: ImageCapture.OutputFileResults) {
+                val savedUri: Uri? = outputFileResults.savedUri
+                FileLogger.d(this@CameraActivity, TAG, "Photo saved: $savedUri")
+                Toast.makeText(this@CameraActivity, "Saved photo", Toast.LENGTH_SHORT).show()
+            }
+
             override fun onError(exception: ImageCaptureException) {
-                FileLogger.e(this@CameraActivity, TAG, "ImageCapture error: ${exception.message}")
+                FileLogger.e(this@CameraActivity, TAG, "Image capture failed: ${exception.message}")
+                Toast.makeText(this@CameraActivity, "Capture failed: ${exception.message}", Toast.LENGTH_SHORT).show()
             }
         })
-    }
-
-    override fun onDestroy() {
-        super.onDestroy()
-        try {
-            midasInterpreter?.close()
-            mobileSamEncoder?.close()
-            mobileSamDecoder?.close()
-        } catch (_: Exception) {}
-        cameraExecutor.shutdown()
-        scope.cancel()
-        FileLogger.d(this, TAG, "CameraActivity destroyed")
     }
 }
