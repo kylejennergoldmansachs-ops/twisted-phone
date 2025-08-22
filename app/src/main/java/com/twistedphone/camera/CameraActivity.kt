@@ -19,6 +19,7 @@ import androidx.appcompat.app.AppCompatActivity
 import androidx.camera.core.*
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
+import androidx.camera.view.PreviewView.ImplementationMode
 import androidx.core.content.ContextCompat
 import com.twistedphone.TwistedApp
 import com.twistedphone.util.Logger
@@ -32,6 +33,16 @@ import java.nio.channels.FileChannel
 import java.util.concurrent.Executors
 import kotlin.math.*
 
+/**
+ * CameraActivity — revised, diagnostic-rich, guaranteed-visible overlay + object-aware warp.
+ *
+ * Key fixes vs prior version:
+ *  - Forces PreviewView to COMPATIBLE (texture) implementation so overlay ImageView is visible on top.
+ *  - Ensures overlayView.bringToFront() and uses post() to set bitmaps on UI thread.
+ *  - Adds guaranteed synthetic mask fallback so preview always shows an effect.
+ *  - Adds detailed logging for conversion, mask size, mask density, offsets min/max, warp actions, and save.
+ *  - Keeps full-res processed-capture pipeline with improved robustness.
+ */
 class CameraActivity : AppCompatActivity() {
     companion object {
         private const val TAG = "CameraActivity"
@@ -39,7 +50,7 @@ class CameraActivity : AppCompatActivity() {
         private val HIGH_PROC_SIZE = Size(1280, 720)
         private const val BASE_TILE_SIZE = 64
         private const val MAX_SHIFT_FRACTION = 0.22f
-        private const val MIN_ANALYSIS_INTERVAL_MS = 100L
+        private const val MIN_ANALYSIS_INTERVAL_MS = 80L
     }
 
     private lateinit var root: FrameLayout
@@ -73,12 +84,19 @@ class CameraActivity : AppCompatActivity() {
         root = FrameLayout(this)
         previewView = PreviewView(this).apply {
             layoutParams = FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT)
+            // Important: use COMPATIBLE mode so overlay ImageView can be drawn on top reliably on most devices.
+            implementationMode = ImplementationMode.COMPATIBLE
         }
+
         overlayView = ImageView(this).apply {
             layoutParams = FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT)
             scaleType = ImageView.ScaleType.CENTER_CROP
             setBackgroundColor(Color.TRANSPARENT)
+            alpha = 1.0f
+            isClickable = false
+            isFocusable = false
         }
+
         captureButton = Button(this).apply {
             text = "CAPTURE"
             setOnClickListener { onCaptureClicked() }
@@ -86,14 +104,20 @@ class CameraActivity : AppCompatActivity() {
 
         root.addView(previewView)
         root.addView(overlayView)
+        // keep overlay explicitly on top
+        overlayView.post { overlayView.bringToFront(); overlayView.invalidate(); Logger.d(TAG, "Overlay brought to front") }
+
         val btnParams = FrameLayout.LayoutParams(FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT)
         btnParams.leftMargin = 16; btnParams.topMargin = 16
         root.addView(captureButton, btnParams)
+
         setContentView(root)
 
+        // Try load midas (async)
         bgScope.launch {
             midasInterpreter = tryLoadMidas()
-            if (midasInterpreter != null) Logger.d(TAG, "Midas model loaded") else Logger.d(TAG, "Midas not found")
+            if (midasInterpreter != null) Logger.d(TAG, "Midas loaded successfully")
+            else Logger.d(TAG, "Midas not present; using edge fallback")
         }
 
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
@@ -119,7 +143,7 @@ class CameraActivity : AppCompatActivity() {
                 cameraProvider = cameraProviderFuture.get()
                 bindUseCases()
             } catch (e: Exception) {
-                Logger.e(TAG, "Camera provider failure: ${e.message}")
+                Logger.e(TAG, "startCamera provider error: ${e.message}")
                 Toast.makeText(this, "Camera start failed", Toast.LENGTH_SHORT).show()
             }
         }, ContextCompat.getMainExecutor(this))
@@ -152,14 +176,15 @@ class CameraActivity : AppCompatActivity() {
                         bgScope.launch {
                             val procBitmap = convertImageProxyToBitmapSafe(image)
                             if (procBitmap != null) {
+                                Logger.d(TAG, "convertImageProxyToBitmapSafe returned ${procBitmap.width}x${procBitmap.height}")
                                 processAndRenderFrame(procBitmap)
                             } else {
-                                Logger.e(TAG, "convertImageProxyToBitmapSafe returned null")
+                                Logger.e(TAG, "convertImageProxyToBitmapSafe -> null")
                             }
                             image.close()
                         }
                     } catch (e: Exception) {
-                        Logger.e(TAG, "analyzer error: ${e.message}")
+                        Logger.e(TAG, "analyzer outer error: ${e.message}")
                         image.close()
                     }
                 }
@@ -168,13 +193,14 @@ class CameraActivity : AppCompatActivity() {
         try {
             val selector = CameraSelector.DEFAULT_BACK_CAMERA
             provider.bindToLifecycle(this, selector, preview, imageCapture, imageAnalysis)
+            Logger.d(TAG, "Camera bound use cases (preview, capture, analysis)")
         } catch (e: Exception) {
-            Logger.e(TAG, "bind camera failed: ${e.message}")
+            Logger.e(TAG, "bindToLifecycle failed: ${e.message}")
             Toast.makeText(this, "Camera bind failed", Toast.LENGTH_SHORT).show()
         }
     }
 
-    // robust conversion: respects strides and pixelStride, returns scaled bitmap to DEFAULT_PROC_SIZE
+    // Robust conversion with logs; returns scaled bitmap sized to DEFAULT_PROC_SIZE
     private fun convertImageProxyToBitmapSafe(image: ImageProxy): Bitmap? {
         try {
             val width = image.width
@@ -194,10 +220,13 @@ class CameraActivity : AppCompatActivity() {
             val vRowStride = vPlane.rowStride
             val vPixelStride = vPlane.pixelStride
 
+            Logger.d(TAG, "Y plane rowStride=$yRowStride pixelStride=$yPixelStride; U plane rowStride=$uRowStride pixelStride=$uPixelStride; V plane rowStride=$vRowStride pixelStride=$vPixelStride")
+
             val ySize = width * height
             val chromaSize = ySize / 2
             val nv21 = ByteArray(ySize + chromaSize)
 
+            // copy Y
             var pos = 0
             val yRow = ByteArray(yRowStride)
             yBuffer.position(0)
@@ -239,9 +268,15 @@ class CameraActivity : AppCompatActivity() {
             val yuvImage = android.graphics.YuvImage(nv21, android.graphics.ImageFormat.NV21, width, height, null)
             val out = ByteArrayOutputStream()
             val ok = yuvImage.compressToJpeg(android.graphics.Rect(0, 0, width, height), 85, out)
-            if (!ok) return null
+            if (!ok) {
+                Logger.e(TAG, "YuvImage.compressToJpeg returned false")
+                return null
+            }
             val bytes = out.toByteArray()
-            var bmp = BitmapFactory.decodeByteArray(bytes, 0, bytes.size) ?: return null
+            var bmp = BitmapFactory.decodeByteArray(bytes, 0, bytes.size) ?: run {
+                Logger.e(TAG, "BitmapFactory.decodeByteArray -> null")
+                return null
+            }
 
             val rotation = image.imageInfo.rotationDegrees
             if (rotation != 0) {
@@ -249,41 +284,84 @@ class CameraActivity : AppCompatActivity() {
                 val rotated = Bitmap.createBitmap(bmp, 0, 0, bmp.width, bmp.height, matrix, true)
                 bmp.recycle()
                 bmp = rotated
+                Logger.d(TAG, "Rotated bitmap by $rotation deg")
             }
 
+            // scale to DEFAULT_PROC_SIZE to keep processing stable
             val proc = Bitmap.createScaledBitmap(bmp, DEFAULT_PROC_SIZE.width, DEFAULT_PROC_SIZE.height, true)
             bmp.recycle()
+            Logger.d(TAG, "Converted ImageProxy to proc-bitmap ${proc.width}x${proc.height}")
             return proc
         } catch (e: Exception) {
-            Logger.e(TAG, "convertImageProxyToBitmapSafe failed: ${e.message}")
+            Logger.e(TAG, "convertImageProxyToBitmapSafe EX: ${e.message}")
             return null
         }
     }
 
+    // Main pipeline: mask -> offsets -> warp -> atmosphere -> preview update (with diagnostic logs)
     private suspend fun processAndRenderFrame(smallBitmap: Bitmap) {
         try {
             val enhanced = TwistedApp.instance.settingsPrefs.getBoolean("enhanced_camera_mode", false)
-
-            val depthSmall: Array<FloatArray>? = midasInterpreter?.let { runMidasSafely(it, smallBitmap) }
+            // 1) depth if available
+            val depthSmall = midasInterpreter?.let { runMidasSafely(it, smallBitmap) }
+            if (depthSmall != null) Logger.d(TAG, "Depth map size: ${depthSmall.size}x${depthSmall[0].size}")
             val maskSmall = computeMaskFromDepthOrEdges(depthSmall, smallBitmap)
+            // compute mask density
+            var maskCount = 0
+            for (r in maskSmall) for (v in r) if (v) maskCount++
+            val totalPixels = maskSmall.size * maskSmall[0].size
+            val density = maskCount.toFloat() / max(1f, totalPixels.toFloat())
+            Logger.d(TAG, "Mask pixels true=$maskCount / $totalPixels (density=${"%.3f".format(density)})")
+            // fallback: if mask empty, create synthetic center/object mask to guarantee visible effect
+            if (maskCount == 0) {
+                Logger.d(TAG, "Mask empty — creating synthetic fallback mask")
+                val w = maskSmall[0].size; val h = maskSmall.size
+                for (y in 0 until h) {
+                    for (x in 0 until w) {
+                        val cx = w/2; val cy = h/2
+                        val dx = (x - cx).toFloat() / (w/3f)
+                        val dy = (y - cy).toFloat() / (h/3f)
+                        maskSmall[y][x] = (dx*dx + dy*dy) < 1.0f
+                    }
+                }
+            }
             lastMaskSmall = maskSmall
 
             val rowOffsetsSmall = computeRowOffsetsByTile(maskSmall, smallBitmap.width, smallBitmap.height, enhanced)
+            // log offsets stats
+            var minOff = Float.MAX_VALUE; var maxOff = -Float.MAX_VALUE; var anyNonZero = false
+            for (o in rowOffsetsSmall) {
+                minOff = min(minOff, o); maxOff = max(maxOff, o)
+                if (abs(o) > 1f) anyNonZero = true
+            }
+            Logger.d(TAG, "Row offsets small: min=${minOff.roundToInt()} max=${maxOff.roundToInt()} anyNonZero=$anyNonZero")
+            // ensure small visible effect even if offsets near zero
+            if (!anyNonZero) {
+                Logger.d(TAG, "Offsets nearly zero — applying small default offset for preview visibility")
+                for (i in rowOffsetsSmall.indices) rowOffsetsSmall[i] = (if (i%2==0) 6f else -6f)
+            }
             lastRowOffsetsSmall = rowOffsetsSmall
 
             val warpedSmall = warpBitmapTiles(smallBitmap, rowOffsetsSmall, tileSizeFromWidth(smallBitmap.width))
-
             val finalSmall = applyAtmosphereAndSelectiveChromatic(warpedSmall, maskSmall, enhanced)
 
             lastProcessedPreviewBitmap = finalSmall
             withContext(Dispatchers.Main) {
-                try { overlayView.setImageBitmap(finalSmall) } catch (e: Exception) { Logger.e(TAG, "set overlay failed: ${e.message}") }
+                try {
+                    overlayView.setImageBitmap(finalSmall)
+                    overlayView.bringToFront()
+                    overlayView.invalidate()
+                    Logger.d(TAG, "Preview overlay updated with processed bitmap ${finalSmall.width}x${finalSmall.height}")
+                } catch (e: Exception) {
+                    Logger.e(TAG, "Failed to set overlay bitmap: ${e.message}")
+                }
             }
         } catch (e: Exception) {
-            Logger.e(TAG, "processAndRenderFrame failed: ${e.message}")
+            Logger.e(TAG, "processAndRenderFrame EX: ${e.message}")
         }
     }
 
+    // load midas from app files if present
     private fun tryLoadMidas(): Interpreter? {
         return try {
             val f = File(filesDir, "models/midas.tflite")
@@ -305,7 +383,7 @@ class CameraActivity : AppCompatActivity() {
     private fun runMidasSafely(interp: Interpreter, bmp: Bitmap): Array<FloatArray>? {
         return try {
             val inputTensor = interp.getInputTensor(0)
-            val shape = inputTensor.shape()
+            val shape = inputTensor.shape() // [1,H,W,3]
             if (shape.size != 4) return null
             val reqH = shape[1]; val reqW = shape[2]
             val small = Bitmap.createScaledBitmap(bmp, reqW, reqH, true)
@@ -325,6 +403,7 @@ class CameraActivity : AppCompatActivity() {
             val outH = outShape[1]; val outW = outShape[2]
             val out = Array(outH) { FloatArray(outW) }
             interp.run(input, out)
+            Logger.d(TAG, "Midas inference complete")
             out
         } catch (e: Exception) {
             Logger.e(TAG, "runMidasSafely failed: ${e.message}")
@@ -349,6 +428,7 @@ class CameraActivity : AppCompatActivity() {
             dilateMask(mask, 2)
             return mask
         } else {
+            // Sobel edge fallback (robust)
             val pixels = IntArray(width * height)
             val gray = IntArray(width * height)
             bmp.getPixels(pixels, 0, width, 0, 0, width, height)
@@ -364,7 +444,7 @@ class CameraActivity : AppCompatActivity() {
                     val gx = -gray[(y - 1) * width + (x - 1)] + gray[(y - 1) * width + (x + 1)] - 2 * gray[y * width + (x - 1)] + 2 * gray[y * width + (x + 1)] - gray[(y + 1) * width + (x - 1)] + gray[(y + 1) * width + (x + 1)]
                     val gy = -gray[(y - 1) * width + (x - 1)] - 2 * gray[(y - 1) * width + x] - gray[(y - 1) * width + (x + 1)] + gray[(y + 1) * width + (x - 1)] + 2 * gray[(y + 1) * width + x] + gray[(y + 1) * width + (x + 1)]
                     val mag = sqrt((gx * gx + gy * gy).toDouble()).toFloat()
-                    mask[y][x] = mag > 90f
+                    mask[y][x] = mag > 80f
                 }
             }
             dilateMask(mask, 1)
@@ -396,18 +476,11 @@ class CameraActivity : AppCompatActivity() {
         val tilesY = (height + tileSize - 1) / tileSize
         val tileOffsets = Array(tilesY) { FloatArray(tilesX) }
         for (ty in 0 until tilesY) {
-            val y0 = ty * tileSize
-            val y1 = min(height, y0 + tileSize)
+            val y0 = ty * tileSize; val y1 = min(height, y0 + tileSize)
             for (tx in 0 until tilesX) {
-                val x0 = tx * tileSize
-                val x1 = min(width, x0 + tileSize)
+                val x0 = tx * tileSize; val x1 = min(width, x0 + tileSize)
                 var cnt = 0; var tot = 0
-                for (yy in y0 until y1) {
-                    for (xx in x0 until x1) {
-                        tot++
-                        if (mask[yy][xx]) cnt++
-                    }
-                }
+                for (yy in y0 until y1) for (xx in x0 until x1) { tot++; if (mask[yy][xx]) cnt++ }
                 val dens = if (tot == 0) 0f else cnt.toFloat() / tot.toFloat()
                 val base = if (enhanced) 0.12f else 0.05f
                 var shift = base * (1f + dens * 2.4f)
@@ -419,10 +492,7 @@ class CameraActivity : AppCompatActivity() {
         for (y in 0 until height) {
             val ty = y / tileSize
             var s = 0f; var c = 0
-            for (tx in 0 until tilesX) {
-                s += tileOffsets[ty.coerceIn(0, tilesY - 1)][tx]
-                c++
-            }
+            for (tx in 0 until tilesX) { s += tileOffsets[ty.coerceIn(0, tilesY - 1)][tx]; c++ }
             rowOffsets[y] = s / max(1, c)
         }
         val smooth = FloatArray(height)
@@ -466,6 +536,7 @@ class CameraActivity : AppCompatActivity() {
                 out.setPixels(tmp, 0, width, 0, y, width, 1)
             }
         }
+        Logger.d(TAG, "warpBitmapTiles completed (w=${width} h=${height})")
         return out
     }
 
@@ -502,6 +573,7 @@ class CameraActivity : AppCompatActivity() {
                 } catch (_: Exception) {}
             }
         }
+
         return out
     }
 
@@ -521,8 +593,8 @@ class CameraActivity : AppCompatActivity() {
                         val (cx, cy) = queue.removeFirst()
                         minX = min(minX, cx); minY = min(minY, cy)
                         maxX = max(maxX, cx); maxY = max(maxY, cy)
-                        for (ny in max(0, cy - 1) .. min(height - 1, cy + 1)) {
-                            for (nx in max(0, cx - 1) .. min(width - 1, cx + 1)) {
+                        for (ny in max(0, cy - 1)..min(height - 1, cy + 1)) {
+                            for (nx in max(0, cx - 1)..min(width - 1, cx + 1)) {
                                 if (!visited[ny][nx] && mask[ny][nx]) {
                                     visited[ny][nx] = true
                                     queue.add(Pair(nx, ny))
@@ -539,7 +611,7 @@ class CameraActivity : AppCompatActivity() {
         return rects
     }
 
-    // capture
+    // capture flow unchanged but with logs
     private fun onCaptureClicked() {
         val ic = imageCapture ?: run { Toast.makeText(this, "Capture not ready", Toast.LENGTH_SHORT).show(); return }
         val outFile = createTempFileInCache()
@@ -555,6 +627,7 @@ class CameraActivity : AppCompatActivity() {
                         null
                     }
                     if (rawBitmap != null) {
+                        Logger.d(TAG, "Raw capture read: ${rawBitmap.width}x${rawBitmap.height}")
                         val processed = processFullResCapture(rawBitmap)
                         saveProcessedToMediaStore(processed)
                         withContext(Dispatchers.Main) {
@@ -574,7 +647,7 @@ class CameraActivity : AppCompatActivity() {
         })
     }
 
-    private fun createTempFileInCache(): java.io.File {
+    private fun createTempFileInCache(): File {
         val f = File(cacheDir, "cap_${System.currentTimeMillis()}.jpg")
         if (!f.exists()) f.createNewFile()
         return f
@@ -585,41 +658,46 @@ class CameraActivity : AppCompatActivity() {
             val maskSmall = lastMaskSmall
             val offsetsSmall = lastRowOffsetsSmall
             if (maskSmall == null || offsetsSmall == null) {
+                Logger.d(TAG, "No small mask/offsets available; applying atmosphere only")
                 return applyAtmosphereAndSelectiveChromatic(raw, null, TwistedApp.instance.settingsPrefs.getBoolean("enhanced_camera_mode", false))
             }
+
             val fullWidth = raw.width; val fullHeight = raw.height
             val smallW = maskSmall[0].size; val smallH = maskSmall.size
             val maskBmp = Bitmap.createBitmap(smallW, smallH, Bitmap.Config.ALPHA_8)
             val pixels = ByteArray(smallW * smallH)
             var idx = 0
-            for (y in 0 until smallH) {
-                for (x in 0 until smallW) {
-                    pixels[idx++] = if (maskSmall[y][x]) 255.toByte() else 0.toByte()
-                }
-            }
+            for (y in 0 until smallH) for (x in 0 until smallW) pixels[idx++] = if (maskSmall[y][x]) 255.toByte() else 0.toByte()
             maskBmp.copyPixelsFromBuffer(java.nio.ByteBuffer.wrap(pixels))
             val maskFullBmp = Bitmap.createScaledBitmap(maskBmp, fullWidth, fullHeight, true)
             val maskFull = Array(fullHeight) { BooleanArray(fullWidth) }
             val maskPixels = IntArray(fullWidth * fullHeight)
             maskFullBmp.getPixels(maskPixels, 0, fullWidth, 0, 0, fullWidth, fullHeight)
             idx = 0
-            for (y in 0 until fullHeight) {
-                for (x in 0 until fullWidth) {
-                    maskFull[y][x] = (maskPixels[idx] and 0xFF) > 32
-                    idx++
-                }
-            }
+            for (y in 0 until fullHeight) for (x in 0 until fullWidth) { maskFull[y][x] = (maskPixels[idx] and 0xFF) > 32; idx++ }
+
             val offsetsFull = FloatArray(fullHeight)
             for (y in 0 until fullHeight) {
                 val srcY = (y.toFloat() * offsetsSmall.size / fullHeight).toInt().coerceIn(0, offsetsSmall.size - 1)
                 offsetsFull[y] = offsetsSmall[srcY] * (fullWidth.toFloat() / (smallW.toFloat()))
             }
+
+            // if offsetsFull are all zeros, add subtle effect so captures don't look unchanged
+            var nonZero = false
+            for (o in offsetsFull) if (abs(o) > 1f) { nonZero = true; break }
+            if (!nonZero) {
+                Logger.d(TAG, "OffsetsFull all near zero — adding modest capture offsets")
+                for (i in offsetsFull.indices) offsetsFull[i] = (if (i % 2 == 0) 12f else -12f)
+            }
+
+            Logger.d(TAG, "Warping full-res capture with offsetsFull (len=${offsetsFull.size})")
             val tileSize = tileSizeFromWidth(fullWidth)
             val warped = warpBitmapTiles(raw, offsetsFull, tileSize)
             val final = applyAtmosphereAndSelectiveChromatic(warped, maskFull, TwistedApp.instance.settingsPrefs.getBoolean("enhanced_camera_mode", false))
+            Logger.d(TAG, "Full-res processing complete")
             return final
         } catch (e: Exception) {
-            Logger.e(TAG, "processFullResCapture failed: ${e.message}")
+            Logger.e(TAG, "processFullResCapture EX: ${e.message}")
             return raw
         }
     }
@@ -631,9 +709,7 @@ class CameraActivity : AppCompatActivity() {
             val values = ContentValues().apply {
                 put(MediaStore.Images.Media.DISPLAY_NAME, fname)
                 put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                    put(MediaStore.Images.Media.RELATIVE_PATH, "Pictures/TwistedPhone")
-                }
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) put(MediaStore.Images.Media.RELATIVE_PATH, "Pictures/TwistedPhone")
             }
             val uri: Uri? = resolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
             if (uri != null) {
@@ -643,7 +719,7 @@ class CameraActivity : AppCompatActivity() {
                 Logger.e(TAG, "MediaStore insert returned null")
             }
         } catch (e: Exception) {
-            Logger.e(TAG, "saveProcessedToMediaStore failed: ${e.message}")
+            Logger.e(TAG, "saveProcessedToMediaStore EX: ${e.message}")
         }
     }
 }
