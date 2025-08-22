@@ -585,10 +585,16 @@ class CameraActivity : AppCompatActivity() {
             }
             val uri = resolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
             if (uri != null) {
-                resolver.openOutputStream(uri).use { out ->
+                // SAFE CHANGE: openOutputStream returns OutputStream? — use safe-call and handle failure
+                val written = resolver.openOutputStream(uri)?.use { out ->
                     bmp.compress(Bitmap.CompressFormat.JPEG, 90, out)
+                } != null
+
+                if (written) {
+                    Toast.makeText(this, "Saved to gallery", Toast.LENGTH_SHORT).show()
+                } else {
+                    Toast.makeText(this, "Failed to save image", Toast.LENGTH_SHORT).show()
                 }
-                Toast.makeText(this, "Saved to gallery", Toast.LENGTH_SHORT).show()
             } else {
                 Toast.makeText(this, "Failed to save image", Toast.LENGTH_SHORT).show()
             }
