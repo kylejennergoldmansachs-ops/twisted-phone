@@ -1,3 +1,4 @@
+// ModelDownloadWorker.kt (refactored to avoid smart-cast captured vars)
 package com.twistedphone.onboarding
 
 import androidx.work.Worker
@@ -8,6 +9,9 @@ import com.twistedphone.util.FileLogger
 import java.io.File
 import java.io.FileOutputStream
 import java.io.InputStream
+import java.util.concurrent.TimeUnit
+import java.io.FileInputStream
+import java.lang.Exception
 import java.util.concurrent.TimeUnit
 
 /**
@@ -44,8 +48,6 @@ class ModelDownloadWorker(appContext: android.content.Context, params: WorkerPar
             var attempts = 0
             while (!success && attempts < 3) {
                 attempts++
-                var respBodyStream: InputStream? = null
-                var tmpFile: File? = null
                 try {
                     val rb = Request.Builder().url(url)
                     if (token.isNotEmpty()) {
@@ -65,40 +67,41 @@ class ModelDownloadWorker(appContext: android.content.Context, params: WorkerPar
                             // otherwise retry after brief sleep
                             Thread.sleep((1500L * attempts).coerceAtMost(6000L))
                         } else {
-                            respBodyStream = response.body?.byteStream()
-                            if (respBodyStream == null) {
+                            // Use a local non-null val for the response body stream (avoid capturing a mutable var)
+                            val bodyStream: InputStream? = response.body?.byteStream()
+                            if (bodyStream == null) {
                                 FileLogger.e(applicationContext, "ModelDownloadWorker", "Empty body when downloading $name, attempt $attempts")
                                 Thread.sleep((1500L * attempts).coerceAtMost(6000L))
                             } else {
-                                // write to temp file then rename atomically
-                                tmpFile = File(dir, "$name.tmp")
-                                FileOutputStream(tmpFile).use { out ->
+                                // write to temp file then rename atomically using a local tmp val
+                                val tmp = File(dir, "$name.tmp")
+                                FileOutputStream(tmp).use { out ->
                                     val buf = ByteArray(8192)
-                                    var read = respBodyStream.read(buf)
+                                    var read = bodyStream.read(buf)
                                     var written = 0L
                                     while (read >= 0) {
                                         out.write(buf, 0, read)
                                         written += read
-                                        read = respBodyStream.read(buf)
+                                        read = bodyStream.read(buf)
                                     }
                                     out.flush()
                                     out.fd.sync()
                                 }
                                 // basic sanity: file > 100 bytes
-                                if (tmpFile.exists() && tmpFile.length() > 100) {
+                                if (tmp.exists() && tmp.length() > 100) {
                                     val finalFile = File(dir, name)
                                     if (finalFile.exists()) finalFile.delete()
-                                    val renamed = tmpFile.renameTo(finalFile)
+                                    val renamed = tmp.renameTo(finalFile)
                                     if (!renamed) {
                                         // fallback: copy then delete tmp
-                                        tmpFile.copyTo(finalFile, overwrite = true)
-                                        tmpFile.delete()
+                                        tmp.copyTo(finalFile, overwrite = true)
+                                        tmp.delete()
                                     }
                                     FileLogger.d(applicationContext, "ModelDownloadWorker", "Successfully downloaded $name (attempt $attempts)")
                                     success = true
                                 } else {
                                     FileLogger.e(applicationContext, "ModelDownloadWorker", "Downloaded file too small or missing for $name (attempt $attempts)")
-                                    tmpFile?.delete()
+                                    try { tmp.delete() } catch (_: Exception) {}
                                     Thread.sleep((1500L * attempts).coerceAtMost(6000L))
                                 }
                             }
@@ -106,8 +109,10 @@ class ModelDownloadWorker(appContext: android.content.Context, params: WorkerPar
                     }
                 } catch (ex: Exception) {
                     FileLogger.e(applicationContext, "ModelDownloadWorker", "Error downloading $name: ${ex.message}, attempt $attempts")
-                    try { tmpFile?.delete() } catch (_: Exception) {}
-                    try { respBodyStream?.close() } catch (_: Exception) {}
+                    // defensive cleanup using canonical tmp filename (avoid using a captured var)
+                    try { File(dir, "$name.tmp").delete() } catch (_: Exception) {}
+                    // response stream closed by resp.use automatically, but attempt to be robust
+                    try { responseSafeClose(client, url) } catch (_: Exception) {}
                     Thread.sleep((1500L * attempts).coerceAtMost(6000L))
                 }
             }
@@ -120,5 +125,11 @@ class ModelDownloadWorker(appContext: android.content.Context, params: WorkerPar
 
         FileLogger.d(applicationContext, "ModelDownloadWorker", "All models downloaded successfully")
         return Result.success()
+    }
+
+    // best-effort: try to close call resources (no-op in normal flow)
+    private fun responseSafeClose(client: OkHttpClient, url: String) {
+        // nothing to do here in normal OkHttp usage because .use() closed the response.
+        // keep this stub for future robustness or instrumentation.
     }
 }
