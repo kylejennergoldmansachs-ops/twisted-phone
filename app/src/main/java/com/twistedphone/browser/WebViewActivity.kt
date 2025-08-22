@@ -62,14 +62,12 @@ class WebViewActivity : AppCompatActivity() {
 
         web.webViewClient = object : WebViewClient() {
             override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean {
-                // let WebView handle the URL
                 return false
             }
 
             override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
                 Logger.d(TAG, "onPageStarted: $url")
                 url?.let { runOnUiThread { urlInput.setText(it) } }
-                // show white overlay immediately
                 runOnUiThread {
                     showOverlay(true, "LOADING")
                     updateProgressUI(0)
@@ -78,14 +76,13 @@ class WebViewActivity : AppCompatActivity() {
 
             override fun onPageFinished(view: WebView?, url: String?) {
                 Logger.d(TAG, "onPageFinished: $url")
-                // start warp process (runs in background)
                 startTransform(url ?: "")
             }
         }
 
         web.webChromeClient = object : WebChromeClient() {
             override fun onProgressChanged(view: WebView?, newProgress: Int) {
-                // Show raw page loading progress in the progress bar
+                // raw page load progress shown in progress bar but warp progress will overwrite it
                 mainHandler.post { progressBar.progress = newProgress }
             }
         }
@@ -95,7 +92,7 @@ class WebViewActivity : AppCompatActivity() {
             if (actionId == EditorInfo.IME_ACTION_GO) { loadUrlFromInput(); true } else false
         }
 
-        // initial page
+        // initial
         web.loadUrl("https://en.m.wikipedia.org/wiki/Main_Page")
     }
 
@@ -113,72 +110,115 @@ class WebViewActivity : AppCompatActivity() {
     }
 
     /**
-     * Starts the transform pipeline for the currently loaded page.
-     * Shows overlay, attempts Mistral for text, falls back to local twist if needed.
-     * Also processes up to top images by downloading and locally darkening faces.
-     * Ensures overlay is removed after MAX_TIMEOUT_MS.
+     * Main pipeline:
+     *  - Extract visible text snippets and image srcs via evaluateJavascript (safe visible-only extraction)
+     *  - Send top snippets to MistralClient (logged), fallback locally if needed
+     *  - Replace texts in DOM using injected JS
+     *  - Download and locally process up to 10 images (darken faces) and replace src with data: URIs
+     *  - Keeps overlay for up to MAX_TIMEOUT_MS and ensures overlay is removed
      */
     private fun startTransform(url: String) {
         transformJob?.cancel()
         showOverlay(true, "LOADING")
         transformJob = coroutineScope.launch {
-            val start = System.currentTimeMillis()
-            val deadline = start + MAX_TIMEOUT_MS
+            val startTime = System.currentTimeMillis()
+            val deadline = startTime + MAX_TIMEOUT_MS
             try {
                 Logger.d(TAG, "startTransform: extracting DOM for $url")
 
-                val extractJson = extractTextsAndImages()
-                val texts = parseTextsFromExtract(extractJson)
-                val imgs = parseImagesFromExtract(extractJson)
-                Logger.d(TAG, "startTransform: found texts=${texts.size} imgs=${imgs.size}")
+                val rawJsResult = extractTextsAndImagesRawJs()
+                Logger.d(TAG, "Raw JS result: ${rawJsResult.take(2000)}")
+
+                val cleanedJson = cleanEvaluateJavascriptResult(rawJsResult)
+                Logger.d(TAG, "Cleaned JSON extract: ${cleanedJson.take(2000)}")
+
+                val texts = parseTextsFromExtract(cleanedJson).toMutableList()
+                val imgs = parseImagesFromExtract(cleanedJson).toMutableList()
+
+                Logger.d(TAG, "Parsed texts=${texts.size} images=${imgs.size}")
+
+                // fallback if nothing found
+                if (texts.isEmpty()) {
+                    Logger.d(TAG, "No texts found in structured extract; trying body.innerText fallback")
+                    val bodyText = extractBodyInnerText()
+                    Logger.d(TAG, "body.innerText length=${bodyText.length}")
+                    if (bodyText.trim().isNotEmpty()) {
+                        val paras = bodyText.split("\n").map { it.trim() }.filter { it.length > 40 }
+                        texts.addAll(paras.take(6))
+                        Logger.d(TAG, "Added ${paras.take(6).size} paragraphs from body text fallback")
+                    }
+                }
+
+                // Log previews of what we'll send
+                for ((i, t) in texts.withIndex()) Logger.d(TAG, "Text[$i] preview: ${t.take(160).replace("\n", " ")}")
+                for ((i, s) in imgs.withIndex()) Logger.d(TAG, "Image[$i] src: $s")
 
                 val totalWork = max(1, texts.size + imgs.size)
                 var done = 0
 
-                // 1) text transformations
+                // TEXT transforms
                 val replacements = mutableListOf<Pair<String, String>>()
                 for (orig in texts) {
                     if (!isActive) return@launch
                     if (System.currentTimeMillis() > deadline) {
-                        Logger.d(TAG, "Timeout during text transforms")
+                        Logger.d(TAG, "Timeout reached while processing texts")
                         break
                     }
+
                     var twisted: String? = null
                     try {
-                        // attempt Mistral with a clear prompt; using your helper which should wrap API key
-                        twisted = MistralClient.twistTextWithRetries("Rewrite the following text into a darker, stranger, unsettling version while keeping similar length and sentence structure. RETURN ONLY the rewritten text:\n\n$orig", 1, 4)
+                        Logger.d(TAG, "Sending to Mistral (preview): ${orig.take(300).replace("\n", " ")}")
+                        twisted = MistralClient.twistTextWithRetries(
+                            "Rewrite the following text into a darker, stranger, unsettling version while keeping similar length and sentence structure. RETURN ONLY the rewritten text:\n\n$orig",
+                            1, 4
+                        )
+                        Logger.d(TAG, "Mistral reply (raw): ${twisted?.take(2000) ?: "NULL"}")
                     } catch (e: Exception) {
-                        Logger.e(TAG, "Mistral failure: ${e.message}")
+                        Logger.e(TAG, "Mistral call failed: ${e.message}")
+                        twisted = null
                     }
 
                     if (twisted.isNullOrBlank()) {
-                        // local fallback: simple but reliable transformation to ensure page is altered
                         twisted = localTextTwistFallback(orig)
+                        Logger.d(TAG, "Local fallback twist preview: ${twisted.take(200)}")
                     }
 
                     replacements.add(orig to twisted)
                     done++
-                    updateProgress(((done.toFloat() / totalWork.toFloat()) * 100f).toInt())
+                    updateProgressUI(((done.toFloat() / totalWork.toFloat()) * 100f).toInt())
                 }
 
-                // apply text replacements via JS in the page (best-effort)
+                // Inject text replacements into DOM
                 if (replacements.isNotEmpty()) {
                     val js = buildTextReplaceJs(replacements)
-                    runOnUiThread { web.evaluateJavascript(js, null) }
+                    Logger.d(TAG, "Injecting text-replace JS (length=${js.length}). Preview:\n${js.take(800)}")
+                    runOnUiThread {
+                        web.evaluateJavascript(js) { res ->
+                            Logger.d(TAG, "evaluateJavascript (text replace) returned: ${res ?: "null"}")
+                        }
+                    }
+                } else {
+                    Logger.d(TAG, "No text replacements to inject")
                 }
 
-                // 2) image processing (download -> face darken -> inject data URI)
+                // IMAGE processing: download -> darken faces -> data URI replacement
                 for (src in imgs) {
                     if (!isActive) return@launch
                     if (System.currentTimeMillis() > deadline) {
-                        Logger.d(TAG, "Timeout during image transforms")
+                        Logger.d(TAG, "Timeout reached while processing images")
                         break
                     }
                     try {
+                        Logger.d(TAG, "Downloading image: $src")
                         val bmp = downloadBitmap(src)
-                        if (bmp != null) {
+                        if (bmp == null) {
+                            Logger.e(TAG, "Image download null for $src")
+                        } else {
+                            Logger.d(TAG, "Downloaded image ${bmp.width}x${bmp.height}")
                             val processed = darkenFaces(bmp)
+                            Logger.d(TAG, "Processed image ${processed.width}x${processed.height}")
                             val dataUri = bitmapToDataUri(processed)
+                            Logger.d(TAG, "Data URI length for image: ${dataUri.length}")
                             val injectJs = """
                                 (function(){
                                   var imgs = document.getElementsByTagName('img');
@@ -194,27 +234,33 @@ class WebViewActivity : AppCompatActivity() {
                                   }
                                 })();
                             """.trimIndent()
-                            runOnUiThread { web.evaluateJavascript(injectJs, null) }
+                            Logger.d(TAG, "Injecting JS to replace image src for $src")
+                            runOnUiThread {
+                                web.evaluateJavascript(injectJs) { r ->
+                                    Logger.d(TAG, "evaluateJavascript (img replace) returned: ${r ?: "null"}")
+                                }
+                            }
                         }
                     } catch (e: Exception) {
                         Logger.e(TAG, "image transform failed for $src: ${e.message}")
                     }
                     done++
-                    updateProgress(((done.toFloat() / totalWork.toFloat()) * 100f).toInt())
+                    updateProgressUI(((done.toFloat() / totalWork.toFloat()) * 100f).toInt())
                 }
+
+                Logger.d(TAG, "startTransform complete loop done=$done total=$totalWork")
 
             } catch (e: Exception) {
                 Logger.e(TAG, "startTransform job error: ${e.message}")
             } finally {
-                // ensure overlay removed after at most MAX_TIMEOUT_MS from start
-                val elapsed = System.currentTimeMillis() - start
+                val elapsed = System.currentTimeMillis() - startTime
                 val remaining = MAX_TIMEOUT_MS - elapsed
                 if (remaining > 0) delay(remaining)
                 runOnUiThread { showOverlay(false, null) }
             }
         }
 
-        // safety: hard timeout enforcement
+        // hard safety timeout
         mainHandler.postDelayed({
             if (transformJob?.isActive == true) {
                 transformJob?.cancel()
@@ -224,58 +270,48 @@ class WebViewActivity : AppCompatActivity() {
         }, MAX_TIMEOUT_MS)
     }
 
-    // update progress UI from background (this is the helper you were missing)
-    private fun updateProgressUI(progress: Int) {
-        mainHandler.post {
-            val pct = progress.coerceIn(0, 100)
-            loadingPercent.text = "$pct%"
-            progressBar.progress = pct
-            loadingText.text = "TWISTING — $pct%"
-        }
-    }
-
-    // provide a second name used earlier
-    private fun updateProgress(pct: Int) { updateProgressUI(pct) }
-
-    private fun showOverlay(show: Boolean, text: String?) {
-        mainHandler.post {
-            loadingOverlay.visibility = if (show) android.view.View.VISIBLE else android.view.View.GONE
-            if (show) {
-                loadingText.text = text ?: "LOADING"
-                loadingPercent.text = "0%"
-                progressBar.progress = 0
-            }
-        }
-    }
-
-    /**
-     * Runs JS on the page that extracts large text nodes and image srcs, returns a JSON string.
-     */
-    private suspend fun extractTextsAndImages(): String {
+    // Return raw string evaluateJavascript returned (useful for debugging)
+    private suspend fun extractTextsAndImagesRawJs(): String {
         return suspendCancellableCoroutine { cont ->
             val js = """
                 (function(){
+                  function visible(el){
+                    try{
+                      if(!el) return false;
+                      if(el.offsetWidth===0 && el.offsetHeight===0) return false;
+                      var rects = el.getClientRects();
+                      if(!rects || rects.length===0) return false;
+                      if(window.getComputedStyle){
+                        var s = window.getComputedStyle(el);
+                        if(s && (s.visibility==='hidden' || s.display==='none')) return false;
+                      }
+                      return true;
+                    }catch(e){ return false; }
+                  }
                   function collectTextNodes(){
-                    var arr = [];
+                    var arr=[];
                     var walker = document.createTreeWalker(document.body, NodeFilter.SHOW_ELEMENT, null, false);
                     var n;
-                    while(n = walker.nextNode()){
-                      try {
+                    while((n = walker.nextNode())){
+                      try{
+                        if(!visible(n)) continue;
                         var txt = (n.innerText || n.textContent || "").trim();
                         if(txt && txt.length > 20){
-                          arr.push({text: txt, size: txt.length});
+                          var rect = n.getBoundingClientRect();
+                          var area = (rect.width||0) * (rect.height||0);
+                          arr.push({text: txt, area: area, size: txt.length});
                         }
                       } catch(e){}
                     }
-                    arr.sort(function(a,b){return b.size - a.size});
+                    arr.sort(function(a,b){ return (b.area||0) - (a.area||0) });
                     var top = arr.slice(0,10).map(function(x){ return x.text; });
                     return top;
                   }
                   function collectImgs(){
-                    var imgs = [];
+                    var imgs=[];
                     var els = document.getElementsByTagName('img');
                     for(var i=0;i<els.length;i++){
-                      try{ if(els[i].src) imgs.push(els[i].src); }catch(e){}
+                      try{ if(els[i].src && visible(els[i])) imgs.push(els[i].src); }catch(e){}
                     }
                     return imgs.slice(0,10);
                   }
@@ -285,24 +321,46 @@ class WebViewActivity : AppCompatActivity() {
             try {
                 web.evaluateJavascript(js) { result ->
                     if (!cont.isActive) return@evaluateJavascript
-                    try {
-                        val cleaned = when (result) {
-                            "null", "undefined" -> "{}"
-                            else -> {
-                                if (result.length >= 2 && result.startsWith("\"") && result.endsWith("\"")) {
-                                    result.substring(1, result.length - 1)
-                                        .replace("\\n", "")
-                                        .replace("\\\"", "\"")
-                                        .replace("\\\\", "\\")
-                                } else result
-                            }
-                        }
-                        cont.resume(cleaned, null)
-                    } catch (e: Exception) { cont.resumeWith(Result.failure(e)) }
+                    cont.resume(result ?: "") {}
                 }
             } catch (e: Exception) {
                 if (cont.isActive) cont.resumeWith(Result.failure(e))
             }
+        }
+    }
+
+    private suspend fun extractBodyInnerText(): String {
+        return suspendCancellableCoroutine { cont ->
+            val js = "(function(){ try{ return (document.body && document.body.innerText) ? document.body.innerText : ''; }catch(e){ return ''; } })();"
+            try {
+                web.evaluateJavascript(js) { result ->
+                    if (!cont.isActive) return@evaluateJavascript
+                    val cleaned = cleanEvaluateJavascriptResult(result ?: "")
+                    cont.resume(cleaned) {}
+                }
+            } catch (e: Exception) {
+                if (cont.isActive) cont.resumeWith(Result.failure(e))
+            }
+        }
+    }
+
+    // Unwrap the WebView quoted string and other common artifacts
+    private fun cleanEvaluateJavascriptResult(raw: String): String {
+        try {
+            if (raw.isBlank()) return "{}"
+            var s = raw
+            if (s.length >= 2 && s.startsWith("\"") && s.endsWith("\"")) {
+                s = s.substring(1, s.length - 1)
+                    .replace("\\n", "")
+                    .replace("\\t", "")
+                    .replace("\\\"", "\"")
+                    .replace("\\\\", "\\")
+            }
+            if (s == "null" || s == "undefined") return "{}"
+            return s
+        } catch (e: Exception) {
+            Logger.e(TAG, "cleanEvaluateJavascriptResult failed: ${e.message}")
+            return "{}"
         }
     }
 
@@ -338,31 +396,50 @@ class WebViewActivity : AppCompatActivity() {
         }
     }
 
-    /**
-     * Simple HTTP download of an image into a Bitmap (with timeouts).
-     */
+    private fun updateProgressUI(progress: Int) {
+        mainHandler.post {
+            val pct = progress.coerceIn(0, 100)
+            loadingPercent.text = "$pct%"
+            progressBar.progress = pct
+            loadingText.text = "TWISTING — $pct%"
+            Logger.d(TAG, "UI progress updated: $pct%")
+        }
+    }
+
+    private fun showOverlay(show: Boolean, text: String?) {
+        mainHandler.post {
+            loadingOverlay.visibility = if (show) android.view.View.VISIBLE else android.view.View.GONE
+            if (show) {
+                loadingText.text = text ?: "LOADING"
+                loadingPercent.text = "0%"
+                progressBar.progress = 0
+            }
+            Logger.d(TAG, "showOverlay: $show text=$text")
+        }
+    }
+
+    // Download an image (with logging). Returns Bitmap or null
     private fun downloadBitmap(src: String): android.graphics.Bitmap? {
         try {
             val url = URL(src)
             val conn = (url.openConnection() as HttpURLConnection).apply {
-                connectTimeout = 5000
-                readTimeout = 5000
+                connectTimeout = 6000
+                readTimeout = 6000
                 instanceFollowRedirects = true
             }
             conn.connect()
             conn.inputStream.use { stream ->
-                return android.graphics.BitmapFactory.decodeStream(stream)
+                val bmp = android.graphics.BitmapFactory.decodeStream(stream)
+                Logger.d(TAG, "downloadBitmap success for $src -> ${bmp?.width}x${bmp?.height}")
+                return bmp
             }
         } catch (e: Exception) {
-            Logger.e(TAG, "downloadBitmap failed: ${e.message}")
+            Logger.e(TAG, "downloadBitmap failed for $src: ${e.message}")
             return null
         }
     }
 
-    /**
-     * Best-effort local face darkening. Lightweight and fast: draws a semi-opaque oval over central area(s).
-     * Not a production face detector — it's a fallback to ensure images become uncanny even offline.
-     */
+    // Best-effort image face darkening (fast local)
     private fun darkenFaces(src: android.graphics.Bitmap): android.graphics.Bitmap {
         val bmp = src.copy(android.graphics.Bitmap.Config.ARGB_8888, true)
         try {
@@ -371,32 +448,28 @@ class WebViewActivity : AppCompatActivity() {
             val canvas = android.graphics.Canvas(bmp)
             val paint = android.graphics.Paint()
             paint.isAntiAlias = true
-            // Slightly bluish darken to match camera atmosphere
-            paint.color = android.graphics.Color.argb(160, 10, 20, 40)
-            // draw a couple of ovals based on face heuristics (upper center, lower-center)
+            paint.color = android.graphics.Color.argb(170, 6, 12, 30)
             val rect1 = android.graphics.RectF(width * 0.18f, height * 0.12f, width * 0.82f, height * 0.52f)
             canvas.drawOval(rect1, paint)
-            // small second darker patch bottom-left to create uncanny mosaic
-            paint.color = android.graphics.Color.argb(110, 0, 0, 0)
+            paint.color = android.graphics.Color.argb(120, 0, 0, 0)
             val rect2 = android.graphics.RectF(width * 0.05f, height * 0.55f, width * 0.45f, height * 0.95f)
             canvas.drawOval(rect2, paint)
+            Logger.d(TAG, "darkenFaces applied to bitmap ${width}x${height}")
         } catch (e: Exception) {
-            Logger.e(TAG, "darkenFaces failed: ${e.message}")
+            Logger.e(TAG, "darkenFaces error: ${e.message}")
         }
         return bmp
     }
 
     private fun bitmapToDataUri(bmp: android.graphics.Bitmap): String {
         val baos = ByteArrayOutputStream()
-        bmp.compress(android.graphics.Bitmap.CompressFormat.JPEG, 80, baos)
+        bmp.compress(android.graphics.Bitmap.CompressFormat.JPEG, 82, baos)
         val bytes = baos.toByteArray()
         val b64 = Base64.encodeToString(bytes, Base64.NO_WRAP)
         return "data:image/jpeg;base64,$b64"
     }
 
-    // local text twist fallback (guaranteed to produce some change)
     private fun localTextTwistFallback(s: String): String {
-        // reverse words, randomly replace some vowels, then truncate/pad to similar length
         val words = s.split("\\s+".toRegex()).filter { it.isNotBlank() }
         val rev = words.reversed().joinToString(" ")
         val replaced = rev.map { ch ->
@@ -409,32 +482,37 @@ class WebViewActivity : AppCompatActivity() {
                 else -> ch
             }
         }.joinToString("")
-        // try to keep similar length
-        return if (replaced.length <= s.length * 2) replaced else replaced.take(s.length + 10)
+        val out = if (replaced.length <= s.length * 2) replaced else replaced.take(s.length + 10)
+        Logger.d(TAG, "localTextTwistFallback produced len=${out.length}")
+        return out
     }
 
     private fun escapeJsString(s: String): String {
         return s.replace("\\", "\\\\").replace("\"", "\\\"").replace("'", "\\'")
     }
 
+    /**
+     * Build JS that walks the document and replaces occurrences of the extracted snippets.
+     * Uses split/join to avoid regex special char pitfalls.
+     */
     private fun buildTextReplaceJs(replacements: List<Pair<String, String>>): String {
-        // Replace occurrences of the original top snippets with the twisted version.
-        // Use exact string replacement on text nodes (best-effort).
         val sb = StringBuilder()
         sb.append("(function(){")
         sb.append("function walk(node){var child=node.firstChild; while(child){ if(child.nodeType===3){")
         for ((orig, repl) in replacements) {
-            val o = escapeJsString(orig.take(200))
+            val o = escapeForJsString(orig.take(200))
             val r = escapeJsString(repl)
-            // use global replace with regex (escape quotes)
-            sb.append("try{ child.nodeValue = child.nodeValue.replace(new RegExp(${jsonString(o)}, 'g'), ${jsonString(r)}); }catch(e){}")
+            sb.append("try{ if(child.nodeValue && child.nodeValue.indexOf(${jsonString(o)})!==-1) child.nodeValue = child.nodeValue.split(${jsonString(o)}).join(${jsonString(r)}); }catch(e){}")
         }
         sb.append("} else if(child.nodeType===1){ walk(child); } child = child.nextSibling;} }")
         sb.append("walk(document.body); })();")
         return sb.toString()
     }
 
-    // helper to produce a JS JSON-style string literal
+    private fun escapeForJsString(s: String): String {
+        return s.replace("\n", " ").replace("\r", " ").trim()
+    }
+
     private fun jsonString(s: String): String {
         val esc = s.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n").replace("\r", "\\r")
         return "\"$esc\""
