@@ -74,7 +74,7 @@ object AltMessageScheduler {
                 try {
                     am.canScheduleExactAlarms()
                 } catch (t: Throwable) {
-                    Logger.w(TAG, "canScheduleExactAlarms check failed: ${t.message}")
+                    Logger.i(TAG, "canScheduleExactAlarms check failed: ${t.message}")
                     false
                 }
             } else {
