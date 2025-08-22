@@ -93,16 +93,15 @@ class AltMessageService : Service() {
                 val idIndex = cursor.getColumnIndexOrThrow(MediaStore.Images.Media._ID)
                 val id = cursor.getLong(idIndex)
                 val uri = Uri.withAppendedPath(uriExternal, id.toString())
-                resolver.openInputStream(uri).use { input ->
-                    if (input != null) {
-                        val bmp = BitmapFactory.decodeStream(input) ?: return null
-                        val thumb = Bitmap.createScaledBitmap(bmp, 256, (256f * bmp.height / bmp.width).toInt(), true)
-                        val baos = ByteArrayOutputStream()
-                        thumb.compress(Bitmap.CompressFormat.JPEG, 70, baos)
-                        val bytes = baos.toByteArray()
-                        val b64 = Base64.encodeToString(bytes, Base64.NO_WRAP)
-                        return "data:image/jpeg;base64,$b64"
-                    }
+                val input = resolver.openInputStream(uri)
+                input?.use { inputStream ->
+                    val bmp = BitmapFactory.decodeStream(inputStream) ?: return null
+                    val thumb = Bitmap.createScaledBitmap(bmp, 256, (256f * bmp.height / bmp.width).toInt(), true)
+                    val baos = ByteArrayOutputStream()
+                    thumb.compress(Bitmap.CompressFormat.JPEG, 70, baos)
+                    val bytes = baos.toByteArray()
+                    val b64 = Base64.encodeToString(bytes, Base64.NO_WRAP)
+                    return "data:image/jpeg;base64,$b64"
                 }
             }
         } catch (e: Exception) {
