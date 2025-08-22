@@ -11,6 +11,7 @@ import android.database.Cursor
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.net.Uri
+import android.os.Build
 import android.os.IBinder
 import android.provider.MediaStore
 import android.util.Base64
@@ -20,10 +21,15 @@ import com.google.android.gms.tasks.Tasks
 import com.twistedphone.TwistedApp
 import com.twistedphone.ai.MistralClient
 import com.twistedphone.messages.MessageStore
+import com.twistedphone.messages.MessagesActivity
 import com.twistedphone.util.Logger
 import kotlinx.coroutines.*
 import java.io.ByteArrayOutputStream
 
+/**
+ * AltMessageService - generates an alternative-self message and posts a notification.
+ * Fix performed: tapping the notification now opens MessagesActivity.
+ */
 class AltMessageService : Service() {
     private val TAG = "AltMessageService"
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
@@ -39,9 +45,8 @@ class AltMessageService : Service() {
 
     private suspend fun handleWork() {
         val prefs = TwistedApp.instance.settingsPrefs
-        val settings = prefs
-        val includeCameraContext = settings.getBoolean("camera_context", false)
-        val includeLocation = settings.getBoolean("include_location", false)
+        val includeCameraContext = prefs.getBoolean("camera_context", false)
+        val includeLocation = prefs.getBoolean("include_location", false)
 
         var thumbnailDataUri: String? = null
         if (includeCameraContext) {
@@ -81,7 +86,6 @@ class AltMessageService : Service() {
     }
 
     private fun getMostRecentImageAsDataUri(): String? {
-        // Query MediaStore for the most recent image (may be camera or screenshot).
         val resolver: ContentResolver = contentResolver
         val uriExternal: Uri = MediaStore.Images.Media.EXTERNAL_CONTENT_URI
         val projection = arrayOf(MediaStore.Images.Media._ID, MediaStore.Images.Media.DATE_ADDED)
@@ -115,19 +119,27 @@ class AltMessageService : Service() {
     private fun showNotification(text: String) {
         val chId = "alt_messages"
         val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val ch = NotificationChannel(chId, "Alt messages", NotificationManager.IMPORTANCE_DEFAULT)
             nm.createNotificationChannel(ch)
         }
-        val intent = Intent(this, javaClass)
-        val piFlags = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.M)
-            PendingIntent.FLAG_IMMUTABLE or 0 else 0
+
+        // IMPORTANT: open MessagesActivity when user taps the notification
+        val intent = Intent(this, MessagesActivity::class.java).apply {
+            flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP
+        }
+        val piFlags = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M)
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+        else
+            PendingIntent.FLAG_UPDATE_CURRENT
         val pi = PendingIntent.getActivity(this, 0, intent, piFlags)
+
         val n = NotificationCompat.Builder(this, chId)
-            .setContentTitle("Message from someone...")
+            .setContentTitle("Message from someone.")
             .setContentText(text)
             .setContentIntent(pi)
             .setSmallIcon(android.R.drawable.ic_dialog_info)
+            .setAutoCancel(true)
             .build()
         nm.notify((System.currentTimeMillis() % 10000).toInt(), n)
     }
