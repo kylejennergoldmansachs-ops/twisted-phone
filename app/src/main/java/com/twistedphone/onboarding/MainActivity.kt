@@ -3,12 +3,14 @@ package com.twistedphone.onboarding
 import android.Manifest
 import android.app.Activity
 import android.app.AlarmManager
-import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
 import android.graphics.Bitmap
+import android.net.Uri
+import android.os.Build
 import android.os.Bundle
 import android.provider.MediaStore
+import android.provider.Settings
 import android.util.Base64
 import android.view.View
 import android.widget.Button
@@ -36,6 +38,8 @@ import java.io.ByteArrayOutputStream
 
 class MainActivity : AppCompatActivity() {
     private val REQ_SELFIE = 2345
+    private val REQ_EXACT_ALARM = 4321
+
     private val securePrefs = TwistedApp.instance.securePrefs
     private val settingsPrefs = TwistedApp.instance.settingsPrefs
     private lateinit var progress: ProgressBar
@@ -58,7 +62,7 @@ class MainActivity : AppCompatActivity() {
         val pix = findViewById<EditText>(R.id.pixtralInput)
         val textAgent = findViewById<EditText>(R.id.textAgentInput)
 
-        // sensible defaults (keep as you had)
+        // sensible defaults
         pix.setText("ag:ddacd900:20250418:untitled-agent:8dfc3563")
         textAgent.setText("ag:ddacd900:20250418:genbot-text:2d411523")
 
@@ -74,14 +78,19 @@ class MainActivity : AppCompatActivity() {
             val t = textAgent.text.toString().trim()
 
             if (n.isNotEmpty() && k.isNotEmpty()) {
-                // store values in secure prefs (secrets) and in settings prefs (MistralClient reads settingsPrefs)
-                securePrefs.edit().putString("player_name", n).putString("mistral_key", k).putString("huggingface_token", hfToken).putString("pix_agent", p).putString("text_agent", t).apply()
+                // store secrets and settings
+                securePrefs.edit()
+                    .putString("player_name", n)
+                    .putString("mistral_key", k)
+                    .putString("huggingface_token", hfToken)
+                    .putString("pix_agent", p)
+                    .putString("text_agent", t)
+                    .apply()
 
-                // Also store the keys where MistralClient expects them:
                 settingsPrefs.edit()
                     .putString("player_name", n)
-                    .putString("mistral_api_key", k)        // key MistralClient will read
-                    .putString("mistral_agent", if (t.isNotBlank()) t else p) // prefer textAgent, fall back to pix agent
+                    .putString("mistral_api_key", k)
+                    .putString("mistral_agent", if (t.isNotBlank()) t else p)
                     .putString("huggingface_token", hfToken)
                     .apply()
 
@@ -90,7 +99,7 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
-        // Request permissions required for onboarding flow
+        // Request runtime permissions required for onboarding flow
         requestPermissions(arrayOf(Manifest.permission.CAMERA, Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.POST_NOTIFICATIONS), 101)
     }
 
@@ -109,29 +118,24 @@ class MainActivity : AppCompatActivity() {
             bmp.compress(Bitmap.CompressFormat.JPEG, 80, baos)
             val b64 = Base64.encodeToString(baos.toByteArray(), Base64.NO_WRAP)
 
-            // store selfie in secure prefs (private)
+            // store selfie in secure prefs (private) and in settings for other code paths
             securePrefs.edit().putString("selfie_b64", b64).apply()
-            // and in settings prefs too for any components that may read from settingsPrefs
             settingsPrefs.edit().putString("selfie_b64", b64).apply()
 
-            // generate distorted selfie for AS using MistralClient singleton
+            // optionally create a distorted selfie for AS (background)
             CoroutineScope(Dispatchers.Main).launch {
                 val client = MistralClient
                 val distorted: String? = withContext(Dispatchers.IO) {
                     try {
                         client.transformImageToDataUri("data:image/jpeg;base64,$b64")
                     } catch (e: Exception) {
-                        // safe fallback: return null
                         null
                     }
                 }
-                // store only if we actually got something back
                 if (!distorted.isNullOrBlank()) {
                     securePrefs.edit().putString("as_selfie_b64", distorted).apply()
                     settingsPrefs.edit().putString("as_selfie_b64", distorted).apply()
                 } else {
-                    // Clear potential leftover or leave previous value — here we simply log via prefs removal
-                    // (keeps behavior explicit)
                     securePrefs.edit().remove("as_selfie_b64").apply()
                     settingsPrefs.edit().remove("as_selfie_b64").apply()
                 }
@@ -142,6 +146,16 @@ class MainActivity : AppCompatActivity() {
             } else {
                 downloadModels()
             }
+        } else if (req == REQ_EXACT_ALARM) {
+            // Returned from the exact-alarm permission screen. Attempt to schedule unlocks (scheduler will re-check capability)
+            try {
+                AltMessageScheduler.scheduleUnlocks(this)
+            } catch (t: Throwable) {
+                t.printStackTrace()
+            }
+            // continue to home regardless
+            startActivity(Intent(this, FakeHomeActivity::class.java))
+            finish()
         }
     }
 
@@ -151,7 +165,6 @@ class MainActivity : AppCompatActivity() {
         loadingText.text = "Downloading models..."
         val constraints = Constraints.Builder().setRequiredNetworkType(NetworkType.CONNECTED).build()
 
-        // Create input data for the worker
         val inputData = Data.Builder()
             .putString("HUGGINGFACE_TOKEN", huggingfaceToken)
             .build()
@@ -165,34 +178,54 @@ class MainActivity : AppCompatActivity() {
         WorkManager.getInstance(this).getWorkInfoByIdLiveData(work.id).observe(this) { info ->
             if (info.state.isFinished) {
                 progress.visibility = View.GONE
-                if (info.state.name == "SUCCEEDED") {
-                    loadingText.text = "Models downloaded."
-                } else {
-                    loadingText.text = "Model download failed, using fallbacks."
-                }
+                loadingText.text = if (info.state.name == "SUCCEEDED") "Models downloaded." else "Model download failed, using fallbacks."
                 startHome()
             }
         }
     }
 
-    private fun scheduleUnlocks() {
-        val alarmMgr = getSystemService(Context.ALARM_SERVICE) as AlarmManager
-        val intent = Intent(this, AltUnlockReceiver::class.java)
-        val alarmIntent = PendingIntent.getBroadcast(this, 0, intent, PendingIntent.FLAG_IMMUTABLE)
-        val triggerTime = System.currentTimeMillis() + (2 * 60 * 60 * 1000) // 2 hours
-
-        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.M) {
-            alarmMgr.setExactAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, triggerTime, alarmIntent)
-        } else {
-            alarmMgr.setExact(AlarmManager.RTC_WAKEUP, triggerTime, alarmIntent)
-        }
-    }
-
     private fun startHome() {
-        // mark install time and schedule unlocks
+        // mark install time
         securePrefs.edit().putLong("install_time", System.currentTimeMillis()).apply()
         settingsPrefs.edit().putLong("install_time", System.currentTimeMillis()).apply()
-        AltMessageScheduler.scheduleUnlocks(this)
+
+        // If platform requires explicit exact-alarm grant, send user to the system settings screen.
+        val alarmMgr = getSystemService(Context.ALARM_SERVICE) as? AlarmManager
+        val needsRequest = if (alarmMgr == null) {
+            false
+        } else {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                try {
+                    !alarmMgr.canScheduleExactAlarms()
+                } catch (t: Throwable) {
+                    // defensive: if check fails, don't block the flow
+                    false
+                }
+            } else {
+                false
+            }
+        }
+
+        if (needsRequest) {
+            val intent = Intent(Settings.ACTION_REQUEST_SCHEDULE_EXACT_ALARM)
+            intent.data = Uri.parse("package:$packageName")
+            try {
+                startActivityForResult(intent, REQ_EXACT_ALARM)
+                // return here; onActivityResult will resume flow
+                return
+            } catch (t: Throwable) {
+                // if the settings activity call fails, fall through and try scheduling (scheduler will fallback)
+                t.printStackTrace()
+            }
+        }
+
+        // proceed: scheduler will check permissions and fall back if necessary
+        try {
+            AltMessageScheduler.scheduleUnlocks(this)
+        } catch (t: Throwable) {
+            t.printStackTrace()
+        }
+
         startActivity(Intent(this, FakeHomeActivity::class.java))
         finish()
     }
