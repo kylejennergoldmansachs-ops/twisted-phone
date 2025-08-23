@@ -29,10 +29,6 @@ import kotlinx.coroutines.*
 import org.tensorflow.lite.Interpreter
 import java.io.ByteArrayOutputStream
 import java.io.File
-import java.io.InputStreamReader
-import java.nio.ByteBuffer
-import java.nio.ByteOrder
-import java.nio.channels.FileChannel
 import java.util.concurrent.Executors
 import kotlin.math.*
 
@@ -51,7 +47,7 @@ class CameraActivity : AppCompatActivity() {
     private lateinit var previewView: PreviewView
     private lateinit var overlayView: ImageView
     private lateinit var btnCapture: Button
-    private lateinit var btnFlip: Button
+    private lateinit var btnToggle: Button
 
     private val cameraExecutor = Executors.newSingleThreadExecutor()
     private val scope = CoroutineScope(Dispatchers.Main + SupervisorJob())
@@ -77,7 +73,8 @@ class CameraActivity : AppCompatActivity() {
 
         previewView = findViewById(R.id.previewView)
         btnCapture = findViewById(R.id.btnCapture)
-        btnFlip = findViewById(R.id.btnFlip)
+        // layout has btnToggle (Flip) - match the layout id
+        btnToggle = findViewById(R.id.btnToggle)
 
         // overlay view on top
         overlayView = ImageView(this).apply {
@@ -88,7 +85,7 @@ class CameraActivity : AppCompatActivity() {
         (previewView.parent as? FrameLayout)?.addView(overlayView)
 
         btnCapture.setOnClickListener { takePicture() }
-        btnFlip.setOnClickListener {
+        btnToggle.setOnClickListener {
             lensFacing = if (lensFacing == CameraSelector.LENS_FACING_BACK) CameraSelector.LENS_FACING_FRONT else CameraSelector.LENS_FACING_BACK
             bindCameraUseCases()
         }
@@ -97,7 +94,6 @@ class CameraActivity : AppCompatActivity() {
         val dumpButton = Button(this).apply {
             text = "DUMP MODELS"
             textSize = 12f
-            val sizePx = (44 * resources.displayMetrics.density).toInt()
             val params = FrameLayout.LayoutParams(FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT)
             params.gravity = Gravity.TOP or Gravity.END
             params.topMargin = 8
@@ -185,7 +181,6 @@ class CameraActivity : AppCompatActivity() {
     }
 
     private fun analyzeFrame(proxy: ImageProxy) {
-        val mediaImage = proxy.image ?: run { proxy.close(); return }
         val bmp = try { imageProxyToBitmap(proxy) } catch (e: Exception) { null }
         if (bmp == null) { proxy.close(); return }
 
@@ -204,12 +199,9 @@ class CameraActivity : AppCompatActivity() {
         }
     }
 
-    // Robust YUV_420_888 -> ARGB_8888 conversion (as earlier)
+    // Robust YUV_420_888 -> ARGB_8888 conversion
     private fun imageProxyToBitmap(imageProxy: ImageProxy): Bitmap? {
         val image = imageProxy.image ?: return null
-        if (image.format != ImageFormat.YUV_420_888) {
-            // fallback not supported here
-        }
 
         val width = image.width
         val height = image.height
@@ -307,7 +299,6 @@ class CameraActivity : AppCompatActivity() {
             val frac = c.toFloat() / w.toFloat()
             offsets[y] = frac * frac * (w * 0.12f)
         }
-        // smoothing
         val rad = 6
         val sm = FloatArray(h)
         for (y in 0 until h) {
@@ -369,19 +360,15 @@ class CameraActivity : AppCompatActivity() {
     private fun onDumpModelsClicked() {
         scope.launch {
             try {
-                // Ensure the inspector exists in your project and is working
                 withContext(Dispatchers.IO) {
                     FileLogger.d(this@CameraActivity, TAG, "Starting TFLiteInspector.dumpModelsInAppModelsDir")
-                    // This will create files/tflite_signatures.txt if models exist
                     TFLiteInspector.dumpModelsInAppModelsDir(this@CameraActivity)
                     FileLogger.d(this@CameraActivity, TAG, "TFLiteInspector finished")
                 }
 
-                // Read the written file and display it
                 val fileName = "tflite_signatures.txt"
                 val file = File(filesDir, fileName)
                 if (!file.exists()) {
-                    // show message if not present
                     showTextDialog("No dump file", "Inspector did not produce $fileName. Check ModelDownloadWorker or ensure models are in files/models/")
                     FileLogger.d(this@CameraActivity, TAG, "Dump file not found: ${file.absolutePath}")
                     return@launch
@@ -391,7 +378,6 @@ class CameraActivity : AppCompatActivity() {
                     file.readText(Charsets.UTF_8)
                 }
 
-                // Log and show dialog
                 FileLogger.d(this@CameraActivity, TAG, "Model dump:\n$content")
                 showTextDialog("TFLite Signatures Dump", content, allowCopy = true)
 
