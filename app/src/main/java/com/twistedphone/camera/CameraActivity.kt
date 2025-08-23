@@ -201,49 +201,69 @@ class CameraActivity : AppCompatActivity() {
         }
     }
 
+    /**
+     * Robust YUV_420_888 (ImageProxy) -> NV21 -> Bitmap conversion.
+     *
+     * Uses each plane's rowStride + pixelStride to build correct interleaved VU (NV21) chroma bytes.
+     * This helps avoid device-specific artifacts caused by naive copying.
+     */
     private fun imageProxyToBitmap(image: ImageProxy): Bitmap? {
         try {
-            val yBuffer = image.planes[0].buffer
-            val uBuffer = image.planes[1].buffer
-            val vBuffer = image.planes[2].buffer
+            // planes: Y, U, V
+            val planes = image.planes
+            val yPlane = planes[0]
+            val uPlane = planes[1]
+            val vPlane = planes[2]
 
-            val ySize = yBuffer.remaining()
-            val uSize = uBuffer.remaining()
-            val vSize = vBuffer.remaining()
-
-            val nv21 = ByteArray(ySize + uSize + vSize)
-            yBuffer.get(nv21, 0, ySize)
-
-            val rowStride = image.planes[1].rowStride
-            val pixelStride = image.planes[1].pixelStride
-
-            val uBytes = ByteArray(uSize)
-            val vBytes = ByteArray(vSize)
-            uBuffer.get(uBytes)
-            vBuffer.get(vBytes)
-
-            var pos = ySize
             val width = image.width
             val height = image.height
+
+            val ySize = yPlane.buffer.remaining()
+            val uSize = uPlane.buffer.remaining()
+            val vSize = vPlane.buffer.remaining()
+
+            // NV21 size = Y + interleaved VU (which has same size as U+V)
+            val nv21 = ByteArray(ySize + uSize + vSize)
+
+            // copy Y directly (it is already contiguous)
+            yPlane.buffer.get(nv21, 0, ySize)
+
+            var offset = ySize
+
+            val chromaRowStrideU = uPlane.rowStride
+            val chromaRowStrideV = vPlane.rowStride
+            val chromaPixelStrideU = uPlane.pixelStride
+            val chromaPixelStrideV = vPlane.pixelStride
+
+            val uBuffer = uPlane.buffer
+            val vBuffer = vPlane.buffer
+
+            // absolute gets are safe; do not change buffer positions
             val chromaHeight = height / 2
             val chromaWidth = width / 2
 
             for (row in 0 until chromaHeight) {
-                val base = row * rowStride
-                var col = 0
-                while (col < chromaWidth) {
-                    val vuPos = base + col * pixelStride
-                    val vByte = if (vuPos < vBytes.size) vBytes[vuPos] else 0
-                    val uByte = if (vuPos < uBytes.size) uBytes[vuPos] else 0
-                    if (pos < nv21.size) nv21[pos++] = vByte
-                    if (pos < nv21.size) nv21[pos++] = uByte
-                    col++
+                val uRowStart = row * chromaRowStrideU
+                val vRowStart = row * chromaRowStrideV
+                for (col in 0 until chromaWidth) {
+                    val uIndex = uRowStart + col * chromaPixelStrideU
+                    val vIndex = vRowStart + col * chromaPixelStrideV
+                    // NV21 expects V then U
+                    val vByte = if (vIndex < vBuffer.limit()) vBuffer.get(vIndex) else 0
+                    val uByte = if (uIndex < uBuffer.limit()) uBuffer.get(uIndex) else 0
+                    if (offset < nv21.size) nv21[offset++] = vByte
+                    if (offset < nv21.size) nv21[offset++] = uByte
                 }
             }
 
             val yuvImage = android.graphics.YuvImage(nv21, android.graphics.ImageFormat.NV21, width, height, null)
             val out = ByteArrayOutputStream()
-            yuvImage.compressToJpeg(Rect(0, 0, width, height), 85, out)
+            // quality 85 keeps reasonable size & quality
+            val ok = yuvImage.compressToJpeg(Rect(0, 0, width, height), 85, out)
+            if (!ok) {
+                FileLogger.e(this, TAG, "YuvImage.compressToJpeg returned false")
+                return null
+            }
             val bytes = out.toByteArray()
             return BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
         } catch (e: Exception) {
