@@ -1,411 +1,129 @@
-// CameraActivity.kt
 package com.twistedphone.camera
 
 import android.Manifest
+import android.app.AlertDialog
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.ContentValues
+import android.content.Context
 import android.content.pm.PackageManager
 import android.graphics.*
 import android.media.Image
+import android.os.Build
 import android.os.Bundle
+import android.provider.MediaStore
 import android.util.Size
+import android.view.Gravity
 import android.view.View
-import android.widget.FrameLayout
-import android.widget.ImageView
-import android.widget.Toast
+import android.widget.*
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.camera.core.*
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
 import androidx.core.content.ContextCompat
-import com.google.android.gms.tasks.Tasks
 import com.twistedphone.R
+import com.twistedphone.tflite.TFLiteInspector
 import com.twistedphone.util.FileLogger
 import kotlinx.coroutines.*
 import org.tensorflow.lite.Interpreter
 import java.io.ByteArrayOutputStream
 import java.io.File
-import java.io.FileInputStream
-import java.io.FileOutputStream
+import java.io.InputStreamReader
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.nio.channels.FileChannel
 import java.util.concurrent.Executors
-import java.util.concurrent.TimeUnit
 import kotlin.math.*
 
 /**
- * CameraActivity - replaced/cleaned version.
+ * CameraActivity with an added "Dump Models" button that runs TFLiteInspector.dumpModelsInAppModelsDir(context)
+ * and shows the resulting text file contents in a dialog with "Copy" button so you can paste here.
  *
- * - Uses CameraX Preview + ImageAnalysis
- * - Converts YUV_420_888 -> Bitmap via NV21->YuvImage->JPEG route for reliability
- * - Placeholder MiDaS / MobileSAM hooks are provided with safe types so this compiles
- * - Ensures Tasks.await() timeout overload is used with TimeUnit
- *
- * Requirements:
- * - layout/activity_camera.xml should include a PreviewView with id previewView
- *   and optional buttons with ids btnCapture, btnToggle if you want capture toggles.
+ * Replace your existing CameraActivity.kt with this file.
  */
 class CameraActivity : AppCompatActivity() {
     companion object {
         private const val TAG = "CameraActivity"
-        private const val PROCESSING_MAX_WIDTH = 640 // small for real-time mobile processing
+        private const val PROCESSING_MAX_WIDTH = 640
     }
 
-    // CameraX
     private lateinit var previewView: PreviewView
     private lateinit var overlayView: ImageView
+    private lateinit var btnCapture: Button
+    private lateinit var btnFlip: Button
+
     private val cameraExecutor = Executors.newSingleThreadExecutor()
+    private val scope = CoroutineScope(Dispatchers.Main + SupervisorJob())
+    private var imageCapture: ImageCapture? = null
+    private var cameraProvider: ProcessCameraProvider? = null
     private var lensFacing = CameraSelector.LENS_FACING_BACK
 
-    // coroutine scope for processing
-    private val scope = CoroutineScope(Dispatchers.Main + SupervisorJob())
-
-    // model/interpreter placeholders (may be set by your ModelDownloadWorker setup)
+    // optional interpreters (left null unless you wire them)
     private var midasInterpreter: Interpreter? = null
     private var mobileSamEncoder: Interpreter? = null
     private var mobileSamDecoder: Interpreter? = null
 
-    // last processed outputs for UI smoothing / fallback
-    private var lastMask: Array<BooleanArray>? = null
-    private var lastOffsets: FloatArray? = null
+    private var enhancedCamera = true
 
-    // permission helper
-    private val requestPermissionLauncher =
+    private val requestPermission =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
             if (granted) startCamera() else Toast.makeText(this, "Camera permission required", Toast.LENGTH_SHORT).show()
         }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        setContentView(R.layout.activity_camera) // ensure this layout exists
+        setContentView(R.layout.activity_camera)
 
-        // PreviewView
         previewView = findViewById(R.id.previewView)
+        btnCapture = findViewById(R.id.btnCapture)
+        btnFlip = findViewById(R.id.btnFlip)
 
-        // Add overlay ImageView programmatically on top of preview (avoids layout mismatch)
-        // When the layout already contains overlayView, this will still work but won't duplicate
+        // overlay view on top
         overlayView = ImageView(this).apply {
             layoutParams = FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT)
             scaleType = ImageView.ScaleType.FIT_CENTER
             visibility = View.VISIBLE
         }
-        // parent of PreviewView should be a FrameLayout in the typical camera layout
         (previewView.parent as? FrameLayout)?.addView(overlayView)
 
-        // Request permission if needed and start camera
+        btnCapture.setOnClickListener { takePicture() }
+        btnFlip.setOnClickListener {
+            lensFacing = if (lensFacing == CameraSelector.LENS_FACING_BACK) CameraSelector.LENS_FACING_FRONT else CameraSelector.LENS_FACING_BACK
+            bindCameraUseCases()
+        }
+
+        // Add Dump Models button programmatically (top-right)
+        val dumpButton = Button(this).apply {
+            text = "DUMP MODELS"
+            textSize = 12f
+            val sizePx = (44 * resources.displayMetrics.density).toInt()
+            val params = FrameLayout.LayoutParams(FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT)
+            params.gravity = Gravity.TOP or Gravity.END
+            params.topMargin = 8
+            params.rightMargin = 8
+            layoutParams = params
+            setOnClickListener { onDumpModelsClicked() }
+        }
+        (previewView.parent as? FrameLayout)?.addView(dumpButton)
+
+        // permission & start
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
-            requestPermissionLauncher.launch(Manifest.permission.CAMERA)
+            requestPermission.launch(Manifest.permission.CAMERA)
         } else {
             startCamera()
         }
     }
 
-    private fun startCamera() {
-        val providerFuture = ProcessCameraProvider.getInstance(this)
-        providerFuture.addListener({
-            try {
-                val provider = providerFuture.get()
-                val preview = Preview.Builder().build()
-                val selector = CameraSelector.Builder().requireLensFacing(lensFacing).build()
-                preview.setSurfaceProvider(previewView.surfaceProvider)
-
-                val imageCapture = ImageCapture.Builder()
-                    .setTargetRotation(previewView.display?.rotation ?: 0)
-                    .setTargetResolution(Size(1280, 720))
-                    .build()
-
-                val analysis = ImageAnalysis.Builder()
-                    .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
-                    .setTargetResolution(Size(PROCESSING_MAX_WIDTH, PROCESSING_MAX_WIDTH * 9 / 16))
-                    .build()
-
-                analysis.setAnalyzer(cameraExecutor) { proxy ->
-                    // guard and hand off to coroutine-based pipeline
-                    try {
-                        analyzeFrame(proxy)
-                    } catch (e: Exception) {
-                        FileLogger.e(this@CameraActivity, TAG, "Analyzer exception: ${e.message}")
-                        proxy.close()
-                    }
-                }
-
-                try {
-                    provider.unbindAll()
-                    provider.bindToLifecycle(this, selector, preview, imageCapture, analysis)
-                } catch (e: Exception) {
-                    FileLogger.e(this@CameraActivity, TAG, "bindToLifecycle failed: ${e.message}")
-                }
-
-            } catch (e: Exception) {
-                FileLogger.e(this@CameraActivity, TAG, "Camera start failed: ${e.message}")
-            }
-        }, ContextCompat.getMainExecutor(this))
-    }
-
-    // main per-frame analyzer
-    private fun analyzeFrame(proxy: ImageProxy) {
-        val mediaImage = proxy.image ?: run { proxy.close(); return }
-        val bitmap = imageToBitmap(mediaImage, proxy.imageInfo.rotationDegrees, PROCESSING_MAX_WIDTH)
-        if (bitmap == null) {
-            proxy.close(); return
-        }
-
-        scope.launch {
-            try {
-                // Depth: prefer MiDaS interpreter if available, otherwise an inexpensive luminance-based fallback
-                val depth = if (midasInterpreter != null) runMiDaS(bitmap) else luminanceDepthApprox(bitmap)
-
-                // Mask: prefer MobileSAM if present, otherwise fallback to simple rect heuristics
-                val maskFromSam = runMobileSamIfAvailable(bitmap)
-                val mask = maskFromSam ?: runMaskFallback(bitmap)
-
-                // compute row offsets from depth map (returns float array width*height or row offsets - implementation here produces per-row offsets)
-                val offsets = computeRowOffsetsFromDepth(depth, bitmap.width, bitmap.height)
-
-                lastMask = mask
-                lastOffsets = offsets
-
-                val warped = warpBitmap(bitmap, offsets, mask)
-                val final = applyAtmosphere(warped, mask, enhanced = true)
-
-                withContext(Dispatchers.Main) {
-                    try {
-                        overlayView.setImageBitmap(final)
-                    } catch (e: Exception) {
-                        FileLogger.e(this@CameraActivity, TAG, "UI setImage failed: ${e.message}")
-                    }
-                }
-
-            } catch (e: Exception) {
-                FileLogger.e(this@CameraActivity, TAG, "Frame processing error: ${e.message}")
-            } finally {
-                proxy.close()
-            }
-        }
-    }
-
-    // Convert YUV_420_888 Image -> scaled ARGB Bitmap using YuvImage -> JPEG -> Bitmap
-    private fun imageToBitmap(image: Image, rotation: Int, maxWidth: Int): Bitmap? {
-        return try {
-            val width = image.width
-            val height = image.height
-
-            // Convert to NV21 (Y + V + U) byte array
-            val yPlane = image.planes[0].buffer
-            val uPlane = image.planes[1].buffer
-            val vPlane = image.planes[2].buffer
-
-            val ySize = yPlane.remaining()
-            val uSize = uPlane.remaining()
-            val vSize = vPlane.remaining()
-            val nv21 = ByteArray(ySize + uSize + vSize)
-
-            // copy Y
-            yPlane.get(nv21, 0, ySize)
-
-            // According to Camera2 YUV_420_888 layout, V then U for many devices -> produce NV21: Y V U
-            // Some devices may vary; this approach works for many but if you see color distortions you may need to reorder.
-            vPlane.get(nv21, ySize, vSize)
-            uPlane.get(nv21, ySize + vSize, uSize)
-
-            val yuvImage = android.graphics.YuvImage(nv21, android.graphics.ImageFormat.NV21, width, height, null)
-            val baos = ByteArrayOutputStream()
-            yuvImage.compressToJpeg(Rect(0, 0, width, height), 80, baos)
-            val bytes = baos.toByteArray()
-            var bmp = BitmapFactory.decodeByteArray(bytes, 0, bytes.size) ?: return null
-
-            // scale down to maxWidth while preserving aspect ratio
-            if (bmp.width > maxWidth) {
-                val aspect = bmp.height.toFloat() / bmp.width.toFloat()
-                val targetW = maxWidth
-                val targetH = (targetW * aspect).toInt()
-                bmp = Bitmap.createScaledBitmap(bmp, targetW, targetH, true)
-            }
-
-            // rotate if necessary
-            if (rotation != 0) {
-                val matrix = Matrix()
-                matrix.postRotate(rotation.toFloat())
-                val rotated = Bitmap.createBitmap(bmp, 0, 0, bmp.width, bmp.height, matrix, true)
-                if (rotated !== bmp) {
-                    bmp.recycle()
-                    bmp = rotated
-                }
-            }
-            bmp
-        } catch (e: Exception) {
-            FileLogger.e(this, TAG, "image->bitmap conversion failed: ${e.message}")
-            null
-        }
-    }
-
-    // ---------------------------
-    // MobileSAM integration (best-effort, optional)
-    // ---------------------------
-    // This function attempts to run MobileSAM if interpreters are available.
-    // For now it returns null if not available or on error; it must return an Array<BooleanArray>
-    // where outer dimension equals bitmap.height and inner equals bitmap.width.
-    private suspend fun runMobileSamIfAvailable(bmp: Bitmap): Array<BooleanArray>? = withContext(Dispatchers.Default) {
+    override fun onResume() {
+        super.onResume()
         try {
-            if (mobileSamEncoder == null || mobileSamDecoder == null) return@withContext null
-
-            // Example placeholder: you would convert bmp to the encoder input shape, run encoder, then decoder.
-            // This placeholder returns null to indicate fallback should be used.
-            // If you wire real tflite calls, ensure you return a boolean mask here.
-            return@withContext null
+            val prefs = getSharedPreferences("twisted_prefs", MODE_PRIVATE)
+            enhancedCamera = prefs.getBoolean("enhanced_camera", true)
+            FileLogger.d(this, TAG, "onResume: enhancedCamera=$enhancedCamera")
         } catch (e: Exception) {
-            FileLogger.e(applicationContext, TAG, "MobileSAM run failed: ${e.message}")
-            return@withContext null
+            FileLogger.e(this, TAG, "pref read failed: ${e.message}")
         }
-    }
-
-    // Fallback mask generator (very cheap): find biggest portrait-ish rect using simple heuristics.
-    private fun runMaskFallback(bmp: Bitmap): Array<BooleanArray> {
-        val w = bmp.width
-        val h = bmp.height
-        val mask = Array(h) { BooleanArray(w) { false } }
-
-        // center rect heuristic: fill a centered rectangle proportional to image size
-        val rw = (w * 0.35f).toInt().coerceAtLeast(20)
-        val rh = (h * 0.55f).toInt().coerceAtLeast(20)
-        val left = (w - rw) / 2
-        val top = (h - rh) / 2
-        for (y in top until (top + rh)) {
-            if (y < 0 || y >= h) continue
-            for (x in left until (left + rw)) {
-                if (x < 0 || x >= w) continue
-                mask[y][x] = true
-            }
-        }
-        return mask
-    }
-
-    // ---------------------------
-    // Depth / warp helpers
-    // ---------------------------
-    // Placeholder MiDaS runner — in real usage, run your TFLite interpreter and return a float array of size w*h
-    private fun runMiDaS(bmp: Bitmap): FloatArray {
-        val w = bmp.width
-        val h = bmp.height
-        val out = FloatArray(w * h) { 0.5f } // neutral depth
-        return out
-    }
-
-    private fun luminanceDepthApprox(bmp: Bitmap): FloatArray {
-        val w = bmp.width; val h = bmp.height
-        val out = FloatArray(w * h)
-        val pixels = IntArray(w * h)
-        bmp.getPixels(pixels, 0, w, 0, 0, w, h)
-        for (y in 0 until h) {
-            for (x in 0 until w) {
-                val idx = y * w + x
-                val p = pixels[idx]
-                val r = ((p shr 16) and 0xff)
-                val g = ((p shr 8) and 0xff)
-                val b = (p and 0xff)
-                val lum = (0.299f * r + 0.587f * g + 0.114f * b) / 255f
-                out[idx] = 1f - lum // darker => farther
-            }
-        }
-        return out
-    }
-
-    // compute "row offsets" for a vertical warp effect from a depth map
-    // returns an offsets array of size height * 2: for each row, an x-offset (simpler than dense flow)
-    private fun computeRowOffsetsFromDepth(depth: FloatArray, w: Int, h: Int): FloatArray {
-        // Simple per-row offset computed as average depth in the row, mapped to [-maxOffset, maxOffset]
-        val maxOffset = (w * 0.06f).coerceAtLeast(4f)
-        val offsets = FloatArray(h)
-        for (row in 0 until h) {
-            var sum = 0f
-            val base = row * w
-            for (x in 0 until w) sum += depth[base + x]
-            val avg = sum / w
-            // map depth [0..1] -> offset
-            offsets[row] = (avg - 0.5f) * 2f * maxOffset
-        }
-
-        // smooth offsets (simple box blur)
-        val radius = 3
-        val smoothed = FloatArray(h)
-        for (r in 0 until h) {
-            var count = 0
-            var accum = 0f
-            val lo = max(0, r - radius)
-            val hi = min(h - 1, r + radius)
-            for (k in lo..hi) {
-                accum += offsets[k]
-                count++
-            }
-            smoothed[r] = accum / count
-        }
-        return smoothed
-    }
-
-    // warp bitmap by shifting pixels horizontally according to per-row offsets, mask restricts effect
-    private fun warpBitmap(src: Bitmap, rowOffsets: FloatArray, mask: Array<BooleanArray>): Bitmap {
-        val w = src.width
-        val h = src.height
-        val out = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
-        val srcPixels = IntArray(w * h)
-        val dstPixels = IntArray(w * h)
-        src.getPixels(srcPixels, 0, w, 0, 0, w, h)
-
-        for (y in 0 until h) {
-            val off = rowOffsets.getOrNull(y) ?: 0f
-            val shift = off.roundToInt()
-            for (x in 0 until w) {
-                val idx = y * w + x
-                if (mask[y].getOrNull(x) == true) {
-                    // sample from source with horizontal shift (nearest neighbor)
-                    val sx = (x - shift).coerceIn(0, w - 1)
-                    dstPixels[idx] = srcPixels[y * w + sx]
-                } else {
-                    dstPixels[idx] = srcPixels[idx]
-                }
-            }
-        }
-        out.setPixels(dstPixels, 0, w, 0, 0, w, h)
-        return out
-    }
-
-    // apply atmospheric effect: darken masked areas, add subtle vignette
-    private fun applyAtmosphere(src: Bitmap, mask: Array<BooleanArray>, enhanced: Boolean): Bitmap {
-        val w = src.width; val h = src.height
-        val out = src.copy(Bitmap.Config.ARGB_8888, true)
-        val canvas = Canvas(out)
-        val paint = Paint()
-        val pixels = IntArray(w * h)
-        out.getPixels(pixels, 0, w, 0, 0, w, h)
-
-        // simple darkening on masked pixels and slight color shift
-        for (y in 0 until h) {
-            for (x in 0 until w) {
-                val idx = y * w + x
-                if (mask[y].getOrNull(x) == true) {
-                    val p = pixels[idx]
-                    var r = ((p shr 16) and 0xff)
-                    var g = ((p shr 8) and 0xff)
-                    var b = (p and 0xff)
-                    // apply darkness factor
-                    val factor = if (enhanced) 0.55f else 0.75f
-                    r = (r * factor).toInt().coerceIn(0, 255)
-                    g = (g * (factor * 0.95f)).toInt().coerceIn(0, 255)
-                    b = (b * (factor * 0.9f)).toInt().coerceIn(0, 255)
-                    pixels[idx] = (0xff shl 24) or (r shl 16) or (g shl 8) or b
-                }
-            }
-        }
-        out.setPixels(pixels, 0, w, 0, 0, w, h)
-
-        // vignette paint (subtle)
-        val radius = hypot(w.toDouble(), h.toDouble()).toFloat() * 0.6f
-        val gradient = RadialGradient((w / 2).toFloat(), (h / 2).toFloat(), radius,
-            intArrayOf(0x00000000, 0x22000000), floatArrayOf(0.6f, 1.0f), Shader.TileMode.CLAMP)
-        paint.shader = gradient
-        paint.isFilterBitmap = true
-        canvas.drawRect(0f, 0f, w.toFloat(), h.toFloat(), paint)
-
-        return out
     }
 
     override fun onDestroy() {
@@ -416,7 +134,308 @@ class CameraActivity : AppCompatActivity() {
             midasInterpreter?.close()
             mobileSamEncoder?.close()
             mobileSamDecoder?.close()
-        } catch (_: Exception) { /* ignore */ }
+        } catch (_: Exception) {}
         FileLogger.d(this, TAG, "CameraActivity destroyed")
+    }
+
+    private fun startCamera() {
+        val providerFuture = ProcessCameraProvider.getInstance(this)
+        providerFuture.addListener({
+            cameraProvider = providerFuture.get()
+            bindCameraUseCases()
+        }, ContextCompat.getMainExecutor(this))
+    }
+
+    private fun bindCameraUseCases() {
+        val provider = cameraProvider ?: return
+        try {
+            provider.unbindAll()
+
+            val cameraSelector = CameraSelector.Builder().requireLensFacing(lensFacing).build()
+
+            val preview = Preview.Builder()
+                .setTargetRotation(previewView.display?.rotation ?: 0)
+                .build()
+                .also { it.setSurfaceProvider(previewView.surfaceProvider) }
+
+            imageCapture = ImageCapture.Builder()
+                .setTargetRotation(previewView.display?.rotation ?: 0)
+                .setTargetResolution(Size(2048, 1536))
+                .build()
+
+            val analysis = ImageAnalysis.Builder()
+                .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+                .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_YUV_420_888)
+                .setTargetResolution(Size(PROCESSING_MAX_WIDTH, (PROCESSING_MAX_WIDTH * 16 / 9)))
+                .build()
+
+            analysis.setAnalyzer(cameraExecutor) { proxy ->
+                try {
+                    analyzeFrame(proxy)
+                } catch (e: Exception) {
+                    FileLogger.e(this, TAG, "analyzer threw: ${e.message}")
+                    proxy.close()
+                }
+            }
+
+            provider.bindToLifecycle(this, cameraSelector, preview, imageCapture, analysis)
+        } catch (e: Exception) {
+            FileLogger.e(this, TAG, "bindToLifecycle error: ${e.message}")
+        }
+    }
+
+    private fun analyzeFrame(proxy: ImageProxy) {
+        val mediaImage = proxy.image ?: run { proxy.close(); return }
+        val bmp = try { imageProxyToBitmap(proxy) } catch (e: Exception) { null }
+        if (bmp == null) { proxy.close(); return }
+
+        scope.launch(Dispatchers.Default) {
+            try {
+                // quick fallback mask
+                val mask = runMaskFallback(bmp)
+                val offsets = computeRowOffsets(mask)
+                val warped = warpBitmapFast(bmp, offsets, mask)
+                withContext(Dispatchers.Main) { overlayView.setImageBitmap(warped) }
+            } catch (e: Exception) {
+                FileLogger.e(this@CameraActivity, TAG, "processing failed: ${e.message}")
+            } finally {
+                proxy.close()
+            }
+        }
+    }
+
+    // Robust YUV_420_888 -> ARGB_8888 conversion (as earlier)
+    private fun imageProxyToBitmap(imageProxy: ImageProxy): Bitmap? {
+        val image = imageProxy.image ?: return null
+        if (image.format != ImageFormat.YUV_420_888) {
+            // fallback not supported here
+        }
+
+        val width = image.width
+        val height = image.height
+
+        val yPlane = image.planes[0]
+        val uPlane = image.planes[1]
+        val vPlane = image.planes[2]
+
+        val yBuffer = yPlane.buffer
+        val uBuffer = uPlane.buffer
+        val vBuffer = vPlane.buffer
+
+        val yRowStride = yPlane.rowStride
+        val uRowStride = uPlane.rowStride
+        val vRowStride = vPlane.rowStride
+        val uPixelStride = uPlane.pixelStride
+        val vPixelStride = vPlane.pixelStride
+
+        val nv21 = ByteArray(width * height * 3 / 2)
+        var pos = 0
+
+        val row = ByteArray(yRowStride)
+        for (r in 0 until height) {
+            yBuffer.position(r * yRowStride)
+            yBuffer.get(row, 0, yRowStride)
+            System.arraycopy(row, 0, nv21, pos, width)
+            pos += width
+        }
+
+        val chromaHeight = height / 2
+        val chromaWidth = width / 2
+        val vRow = ByteArray(vRowStride)
+        val uRow = ByteArray(uRowStride)
+        var chromaPos = width * height
+
+        for (r in 0 until chromaHeight) {
+            vBuffer.position(r * vRowStride)
+            vBuffer.get(vRow, 0, vRowStride)
+            uBuffer.position(r * uRowStride)
+            uBuffer.get(uRow, 0, uRowStride)
+            for (c in 0 until chromaWidth) {
+                val vIndex = c * vPixelStride
+                val uIndex = c * uPixelStride
+                val vb = vRow.getOrNull(vIndex) ?: 0
+                val ub = uRow.getOrNull(uIndex) ?: 0
+                nv21[chromaPos++] = vb
+                nv21[chromaPos++] = ub
+            }
+        }
+
+        return try {
+            val yuv = android.graphics.YuvImage(nv21, android.graphics.ImageFormat.NV21, width, height, null)
+            val baos = ByteArrayOutputStream()
+            yuv.compressToJpeg(Rect(0, 0, width, height), 85, baos)
+            val bytes = baos.toByteArray()
+            val opts = BitmapFactory.Options().apply { inPreferredConfig = Bitmap.Config.ARGB_8888 }
+            var bmp = BitmapFactory.decodeByteArray(bytes, 0, bytes.size, opts)
+            if (bmp != null && bmp.width > PROCESSING_MAX_WIDTH) {
+                val aspect = bmp.height.toFloat() / bmp.width.toFloat()
+                val tw = PROCESSING_MAX_WIDTH
+                val th = max(1, (tw * aspect).toInt())
+                val scaled = Bitmap.createScaledBitmap(bmp, tw, th, true)
+                bmp.recycle()
+                bmp = scaled
+            }
+            bmp
+        } catch (e: Exception) {
+            FileLogger.e(this, TAG, "NV21->bitmap decode failed: ${e.message}")
+            null
+        }
+    }
+
+    private fun runMaskFallback(bmp: Bitmap): Array<BooleanArray> {
+        val w = bmp.width; val h = bmp.height
+        val mask = Array(h) { BooleanArray(w) { false } }
+        val rw = (w * 0.35f).toInt().coerceAtLeast(24)
+        val rh = (h * 0.5f).toInt().coerceAtLeast(24)
+        val left = (w - rw) / 2
+        val top = (h - rh) / 2
+        for (y in top until (top + rh)) {
+            if (y < 0 || y >= h) continue
+            for (x in left until (left + rw)) if (x in 0 until w) mask[y][x] = true
+        }
+        return mask
+    }
+
+    private fun computeRowOffsets(mask: Array<BooleanArray>): FloatArray {
+        val h = mask.size
+        val w = if (h > 0) mask[0].size else 0
+        val offsets = FloatArray(h)
+        if (h == 0 || w == 0) return offsets
+        for (y in 0 until h) {
+            var c = 0
+            for (x in 0 until w) if (mask[y][x]) c++
+            val frac = c.toFloat() / w.toFloat()
+            offsets[y] = frac * frac * (w * 0.12f)
+        }
+        // smoothing
+        val rad = 6
+        val sm = FloatArray(h)
+        for (y in 0 until h) {
+            var s = 0f; var n = 0f
+            for (k in -rad..rad) {
+                val yy = (y + k).coerceIn(0, h - 1)
+                val wgh = 1.0f / (1 + kotlin.math.abs(k))
+                s += offsets[yy] * wgh
+                n += wgh
+            }
+            sm[y] = s / n
+        }
+        return sm
+    }
+
+    private fun warpBitmapFast(src: Bitmap, offsets: FloatArray, mask: Array<BooleanArray>): Bitmap {
+        val w = src.width; val h = src.height
+        val srcPixels = IntArray(w * h); src.getPixels(srcPixels, 0, w, 0, 0, w, h)
+        val dstPixels = IntArray(w * h)
+        for (y in 0 until h) {
+            val shift = offsets.getOrNull(y)?.roundToInt() ?: 0
+            val rowBase = y * w
+            for (x in 0 until w) {
+                val idx = rowBase + x
+                dstPixels[idx] = if (mask[y].getOrNull(x) == true) {
+                    val sx = (x - shift).coerceIn(0, w - 1)
+                    srcPixels[rowBase + sx]
+                } else srcPixels[idx]
+            }
+        }
+        val out = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+        out.setPixels(dstPixels, 0, w, 0, 0, w, h)
+        return out
+    }
+
+    private fun takePicture() {
+        val ic = imageCapture ?: run { Toast.makeText(this, "Capture not ready", Toast.LENGTH_SHORT).show(); return }
+        val name = "twisted_${System.currentTimeMillis()}"
+        val contentValues = ContentValues().apply {
+            put(MediaStore.MediaColumns.DISPLAY_NAME, name)
+            put(MediaStore.MediaColumns.MIME_TYPE, "image/jpeg")
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) put(MediaStore.Images.Media.RELATIVE_PATH, "Pictures/TwistedPhone")
+        }
+        val outOptions = ImageCapture.OutputFileOptions.Builder(contentResolver, MediaStore.Images.Media.EXTERNAL_CONTENT_URI, contentValues).build()
+        ic.takePicture(outOptions, ContextCompat.getMainExecutor(this), object: ImageCapture.OnImageSavedCallback {
+            override fun onImageSaved(outputFileResults: ImageCapture.OutputFileResults) {
+                val uri = outputFileResults.savedUri
+                FileLogger.d(this@CameraActivity, TAG, "Saved photo: $uri")
+                Toast.makeText(this@CameraActivity, "Saved: $uri", Toast.LENGTH_SHORT).show()
+            }
+            override fun onError(exception: ImageCaptureException) {
+                FileLogger.e(this@CameraActivity, TAG, "Capture failed: ${exception.message}")
+                Toast.makeText(this@CameraActivity, "Capture failed: ${exception.message}", Toast.LENGTH_SHORT).show()
+            }
+        })
+    }
+
+    /** Called when user taps "DUMP MODELS" */
+    private fun onDumpModelsClicked() {
+        scope.launch {
+            try {
+                // Ensure the inspector exists in your project and is working
+                withContext(Dispatchers.IO) {
+                    FileLogger.d(this@CameraActivity, TAG, "Starting TFLiteInspector.dumpModelsInAppModelsDir")
+                    // This will create files/tflite_signatures.txt if models exist
+                    TFLiteInspector.dumpModelsInAppModelsDir(this@CameraActivity)
+                    FileLogger.d(this@CameraActivity, TAG, "TFLiteInspector finished")
+                }
+
+                // Read the written file and display it
+                val fileName = "tflite_signatures.txt"
+                val file = File(filesDir, fileName)
+                if (!file.exists()) {
+                    // show message if not present
+                    showTextDialog("No dump file", "Inspector did not produce $fileName. Check ModelDownloadWorker or ensure models are in files/models/")
+                    FileLogger.d(this@CameraActivity, TAG, "Dump file not found: ${file.absolutePath}")
+                    return@launch
+                }
+
+                val content = withContext(Dispatchers.IO) {
+                    file.readText(Charsets.UTF_8)
+                }
+
+                // Log and show dialog
+                FileLogger.d(this@CameraActivity, TAG, "Model dump:\n$content")
+                showTextDialog("TFLite Signatures Dump", content, allowCopy = true)
+
+            } catch (e: Exception) {
+                FileLogger.e(this@CameraActivity, TAG, "onDumpModelsClicked failed: ${e.message}")
+                showTextDialog("Dump Error", "Failed to run inspector: ${e.message}")
+            }
+        }
+    }
+
+    /** Show a scrollable dialog with the given text. If allowCopy true show Copy button to copy full text. */
+    private fun showTextDialog(title: String, text: String, allowCopy: Boolean = false) {
+        runOnUiThread {
+            try {
+                val tv = TextView(this).apply {
+                    setTextIsSelectable(true)
+                    setText(text)
+                    setPadding(20, 20, 20, 20)
+                }
+                val scroll = ScrollView(this).apply {
+                    addView(tv)
+                    val params = FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, (resources.displayMetrics.heightPixels * 0.7).toInt())
+                    layoutParams = params
+                }
+                val b = AlertDialog.Builder(this).setTitle(title).setView(scroll).setCancelable(true)
+                if (allowCopy) {
+                    b.setPositiveButton("COPY") { _, _ ->
+                        try {
+                            val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                            val clip = ClipData.newPlainText("tflite_dump", text)
+                            cm.setPrimaryClip(clip)
+                            Toast.makeText(this, "Copied to clipboard", Toast.LENGTH_SHORT).show()
+                        } catch (e: Exception) {
+                            Toast.makeText(this, "Copy failed: ${e.message}", Toast.LENGTH_SHORT).show()
+                        }
+                    }
+                    b.setNegativeButton("CLOSE", null)
+                } else {
+                    b.setPositiveButton("OK", null)
+                }
+                b.show()
+            } catch (e: Exception) {
+                Toast.makeText(this, "Dialog failed: ${e.message}", Toast.LENGTH_LONG).show()
+            }
+        }
     }
 }
