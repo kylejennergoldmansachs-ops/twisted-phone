@@ -202,15 +202,16 @@ class CameraActivity : AppCompatActivity() {
     }
 
     /**
-     * Robust YUV_420_888 (ImageProxy) -> NV21 -> Bitmap conversion.
+     * Adaptive YUV -> Bitmap converter.
      *
-     * Uses each plane's rowStride + pixelStride to build correct interleaved VU (NV21) chroma bytes.
-     * This helps avoid device-specific artifacts caused by naive copying.
+     * Builds both NV21 variants (VU and UV) using plane rowStride/pixelStride and picks the decoded bitmap
+     * with the higher variance (heuristic: avoids channel-swapped / striped output).
      */
     private fun imageProxyToBitmap(image: ImageProxy): Bitmap? {
         try {
-            // planes: Y, U, V
             val planes = image.planes
+            if (planes.size < 3) return null
+
             val yPlane = planes[0]
             val uPlane = planes[1]
             val vPlane = planes[2]
@@ -222,23 +223,32 @@ class CameraActivity : AppCompatActivity() {
             val uSize = uPlane.buffer.remaining()
             val vSize = vPlane.buffer.remaining()
 
-            // NV21 size = Y + interleaved VU (which has same size as U+V)
-            val nv21 = ByteArray(ySize + uSize + vSize)
-
-            // copy Y directly (it is already contiguous)
-            yPlane.buffer.get(nv21, 0, ySize)
-
-            var offset = ySize
-
             val chromaRowStrideU = uPlane.rowStride
             val chromaRowStrideV = vPlane.rowStride
             val chromaPixelStrideU = uPlane.pixelStride
             val chromaPixelStrideV = vPlane.pixelStride
 
+            FileLogger.d(this, TAG, "YUV meta: w=$width h=$height ySize=$ySize uSize=$uSize vSize=$vSize rowStU=$chromaRowStrideU rowStV=$chromaRowStrideV pixStU=$chromaPixelStrideU pixStV=$chromaPixelStrideV")
+
+            // Build two NV21 variants: VU (nv21VU) and UV (nv21UV)
+            val nv21Size = ySize + uSize + vSize
+            val nv21VU = ByteArray(nv21Size)
+            val nv21UV = ByteArray(nv21Size)
+
+            // copy Y plane into both
+            val yBuffer = yPlane.buffer
+            val yBufPos = yBuffer.position()
+            yBuffer.get(nv21VU, 0, ySize)
+            // reset and copy again for second buffer
+            yBuffer.position(yBufPos)
+            yBuffer.get(nv21UV, 0, ySize)
+
+            var offset = ySize
+
             val uBuffer = uPlane.buffer
             val vBuffer = vPlane.buffer
 
-            // absolute gets are safe; do not change buffer positions
+            // Build interleaved chroma for both variants
             val chromaHeight = height / 2
             val chromaWidth = width / 2
 
@@ -248,28 +258,77 @@ class CameraActivity : AppCompatActivity() {
                 for (col in 0 until chromaWidth) {
                     val uIndex = uRowStart + col * chromaPixelStrideU
                     val vIndex = vRowStart + col * chromaPixelStrideV
-                    // NV21 expects V then U
-                    val vByte = if (vIndex < vBuffer.limit()) vBuffer.get(vIndex) else 0
                     val uByte = if (uIndex < uBuffer.limit()) uBuffer.get(uIndex) else 0
-                    if (offset < nv21.size) nv21[offset++] = vByte
-                    if (offset < nv21.size) nv21[offset++] = uByte
+                    val vByte = if (vIndex < vBuffer.limit()) vBuffer.get(vIndex) else 0
+                    // NV21 VU order
+                    if (offset < nv21VU.size) nv21VU[offset] = vByte
+                    if (offset + 1 < nv21VU.size) nv21VU[offset + 1] = uByte
+                    // NV12 (UV) order in the alternate buffer
+                    if (offset < nv21UV.size) nv21UV[offset] = uByte
+                    if (offset + 1 < nv21UV.size) nv21UV[offset + 1] = vByte
+                    offset += 2
                 }
             }
 
+            // decode both NV21 buffers to JPEG -> Bitmap
+            val bmpVU = nv21ToBitmapSafe(nv21VU, width, height)
+            val bmpUV = nv21ToBitmapSafe(nv21UV, width, height)
+
+            // pick the one with larger variance (heuristic: non-garbled images usually have higher variance)
+            val scoreVU = bmpVU?.let { computeBitmapVariance(it) } ?: -1.0
+            val scoreUV = bmpUV?.let { computeBitmapVariance(it) } ?: -1.0
+
+            FileLogger.d(this, TAG, "NV21 pick scores: VU=$scoreVU UV=$scoreUV")
+
+            return when {
+                scoreVU < 0 && scoreUV < 0 -> null
+                scoreVU >= scoreUV -> bmpVU
+                else -> bmpUV
+            }
+        } catch (e: Exception) {
+            FileLogger.e(this, TAG, "Adaptive YUV->Bitmap failed: ${e.message}")
+            return null
+        }
+    }
+
+    private fun nv21ToBitmapSafe(nv21: ByteArray, width: Int, height: Int): Bitmap? {
+        return try {
             val yuvImage = android.graphics.YuvImage(nv21, android.graphics.ImageFormat.NV21, width, height, null)
             val out = ByteArrayOutputStream()
-            // quality 85 keeps reasonable size & quality
             val ok = yuvImage.compressToJpeg(Rect(0, 0, width, height), 85, out)
             if (!ok) {
-                FileLogger.e(this, TAG, "YuvImage.compressToJpeg returned false")
+                FileLogger.e(this, TAG, "compressToJpeg false")
                 return null
             }
             val bytes = out.toByteArray()
-            return BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+            BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
         } catch (e: Exception) {
-            FileLogger.e(this, TAG, "YUV->Bitmap failed: ${e.message}")
-            return null
+            FileLogger.e(this, TAG, "nv21->Bitmap decode failed: ${e.message}")
+            null
         }
+    }
+
+    private fun computeBitmapVariance(bmp: Bitmap): Double {
+        // compute variance over grayscale luminance (fast)
+        val w = bmp.width
+        val h = bmp.height
+        val pixels = IntArray(w * h)
+        bmp.getPixels(pixels, 0, w, 0, 0, w, h)
+
+        var sum = 0.0
+        var sumSq = 0.0
+        val n = (w * h).toDouble()
+        for (p in pixels) {
+            val r = ((p shr 16) and 0xFF)
+            val g = ((p shr 8) and 0xFF)
+            val b = (p and 0xFF)
+            val l = 0.299 * r + 0.587 * g + 0.114 * b
+            sum += l
+            sumSq += l * l
+        }
+        val mean = sum / n
+        val variance = (sumSq / n) - (mean * mean)
+        return variance
     }
 
     private suspend fun processFrameAndShow(src: Bitmap) {
@@ -322,7 +381,6 @@ class CameraActivity : AppCompatActivity() {
         bmp.getPixels(srcPixels, 0, w, 0, 0, w, h)
 
         for (y in 0 until h) {
-            // pick offset by mapping y across offsets rows
             val offIndex = (y.toFloat() * offsets.size / h).toInt().coerceIn(0, offsets.size - 1)
             val offF = offsets[offIndex]
             val off = offF.roundToInt()
@@ -338,7 +396,6 @@ class CameraActivity : AppCompatActivity() {
                     outPixels[rowStart + x] = srcPixels[rowStart + srcX]
                 }
             } else {
-                // copy fast
                 System.arraycopy(srcPixels, rowStart, outPixels, rowStart, w)
             }
         }
@@ -386,7 +443,6 @@ class CameraActivity : AppCompatActivity() {
             for (x in 0 until w) {
                 val d = row[(x.toFloat() * row.size / w).toInt().coerceIn(0, row.size - 1)]
                 val alpha = (d * 80).toInt().coerceIn(0, 100)
-                // pale bluish fog color - compose ARGB (alpha in top byte)
                 val fogColor = (alpha shl 24) or (0x008090A0)
                 fogPixels[y * w + x] = fogColor
             }
@@ -408,18 +464,15 @@ class CameraActivity : AppCompatActivity() {
         }
 
         try {
-            // read shapes and types (should already be cached)
             val inShape = midasInputShape ?: interp.getInputTensor(0).shape().copyOf()
             val outShape = midasOutputShape ?: interp.getOutputTensor(0).shape().copyOf()
             val inType = midasInputType ?: interp.getInputTensor(0).dataType()
             val outType = midasOutputType ?: interp.getOutputTensor(0).dataType()
 
-            // expected: inShape = [1, H, W, C]
             val inH = inShape[1]
             val inW = inShape[2]
             val inC = if (inShape.size >= 4) inShape[3] else 3
 
-            // build input buffer
             val inputByteSize = when (inType) {
                 DataType.UINT8 -> inH * inW * inC
                 DataType.FLOAT32 -> inH * inW * inC * 4
@@ -427,7 +480,6 @@ class CameraActivity : AppCompatActivity() {
             }
             val inputBuf = ByteBuffer.allocateDirect(inputByteSize).order(ByteOrder.nativeOrder())
 
-            // resize bmp to model expected size
             val small = Bitmap.createScaledBitmap(bmp, inW, inH, true)
             val pixels = IntArray(inW * inH)
             small.getPixels(pixels, 0, inW, 0, 0, inW, inH)
@@ -449,7 +501,6 @@ class CameraActivity : AppCompatActivity() {
             }
             inputBuf.rewind()
 
-            // prepare output buffer based on output shape
             val outDims = outShape
             val outTotal = outDims.fold(1) { acc, i -> acc * i }
             val outputByteSize = when (outType) {
@@ -459,7 +510,6 @@ class CameraActivity : AppCompatActivity() {
             }
             val outputBuf = ByteBuffer.allocateDirect(outputByteSize).order(ByteOrder.nativeOrder())
 
-            // invoke
             try {
                 outputBuf.rewind()
                 interp.run(inputBuf, outputBuf)
@@ -469,11 +519,9 @@ class CameraActivity : AppCompatActivity() {
                     FileLogger.e(this, TAG, "Midas run failed (invoke): ${invokeEx.message}")
                     lastMidasErrorLogTime = now
                 }
-                // fallback to simple luminance
                 return fallbackDepthFromLuma(bmp)
             }
 
-            // read output buffer and normalize to 0..1 array
             outputBuf.rewind()
             val outH = outDims[1]
             val outW = outDims[2]
@@ -513,15 +561,12 @@ class CameraActivity : AppCompatActivity() {
                 val rng = (max - min).coerceAtLeast(1)
                 for (y in 0 until outH) for (x in 0 until outW) outArr[y][x] = (outArr[y][x] - min) / rng.toFloat()
             } else {
-                // unknown type, fallback
                 return fallbackDepthFromLuma(bmp)
             }
 
-            // if model output differs from requested (resample to bmp h/w)
             if (outH == bmp.height && outW == bmp.width) {
                 return outArr
             } else {
-                // nearest-resample from outArr to target size (bmp.width,bmp.height)
                 val resized = Array(bmp.height) { FloatArray(bmp.width) }
                 for (y in 0 until bmp.height) {
                     val sy = (y.toFloat() * outH / bmp.height).toInt().coerceIn(0, outH - 1)
@@ -542,7 +587,6 @@ class CameraActivity : AppCompatActivity() {
         }
     }
 
-    // Simple fallback: use normalized luminance as depth
     private fun fallbackDepthFromLuma(bmp: Bitmap): Array<FloatArray> {
         val w = bmp.width
         val h = bmp.height
@@ -557,7 +601,6 @@ class CameraActivity : AppCompatActivity() {
                 val g = ((p shr 8) and 0xFF)
                 val b = (p and 0xFF)
                 val l = (0.299f * r + 0.587f * g + 0.114f * b) / 255.0f
-                // invert l so bright -> near (0), dark -> far (1)
                 out[y][x] = 1.0f - l
             }
         }
@@ -600,31 +643,6 @@ class CameraActivity : AppCompatActivity() {
             FileLogger.e(this, TAG, "Save failed: ${e.message}")
             false
         }
-    }
-
-    private fun takePictureUsingImageCapture() {
-        val ic = imageCapture ?: run {
-            Toast.makeText(this, "Capture not ready", Toast.LENGTH_SHORT).show()
-            return
-        }
-        val name = "twisted_${System.currentTimeMillis()}"
-        val contentValues = ContentValues().apply {
-            put(MediaStore.MediaColumns.DISPLAY_NAME, name)
-            put(MediaStore.MediaColumns.MIME_TYPE, "image/jpeg")
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) put(MediaStore.Images.Media.RELATIVE_PATH, "Pictures/TwistedPhone")
-        }
-        val outOptions = ImageCapture.OutputFileOptions.Builder(contentResolver, MediaStore.Images.Media.EXTERNAL_CONTENT_URI, contentValues).build()
-        ic.takePicture(outOptions, ContextCompat.getMainExecutor(this), object: ImageCapture.OnImageSavedCallback {
-            override fun onImageSaved(outputFileResults: ImageCapture.OutputFileResults) {
-                val uri = outputFileResults.savedUri
-                FileLogger.d(this@CameraActivity, TAG, "Saved photo: $uri")
-                Toast.makeText(this@CameraActivity, "Saved: $uri", Toast.LENGTH_SHORT).show()
-            }
-            override fun onError(exception: ImageCaptureException) {
-                FileLogger.e(this@CameraActivity, TAG, "Capture failed: ${exception.message}")
-                Toast.makeText(this@CameraActivity, "Capture failed: ${exception.message}", Toast.LENGTH_SHORT).show()
-            }
-        })
     }
 
     override fun onDestroy() {
