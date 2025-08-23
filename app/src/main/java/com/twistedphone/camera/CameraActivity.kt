@@ -4,6 +4,7 @@ import android.Manifest
 import android.content.ContentValues
 import android.content.pm.PackageManager
 import android.graphics.*
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.provider.MediaStore
@@ -35,8 +36,9 @@ import kotlin.math.*
 class CameraActivity : AppCompatActivity() {
     companion object {
         private const val TAG = "CameraActivity"
-        // throttle heavy model every N frames
-        private const val MIDAS_FRAME_SKIP = 3
+        // fallback processing size for speed when model not available
+        private const val FALLBACK_PROC_W = 256
+        private const val FALLBACK_PROC_H = 256
     }
 
     private lateinit var previewView: PreviewView
@@ -93,10 +95,10 @@ class CameraActivity : AppCompatActivity() {
         btnCapture.setOnClickListener {
             ioScope.launch {
                 latestWarped?.let { bmp ->
-                    if (saveBitmapToGallery(bmp)) {
-                        withContext(Dispatchers.Main) { Toast.makeText(this@CameraActivity, "Saved warped image", Toast.LENGTH_SHORT).show() }
-                    } else {
-                        withContext(Dispatchers.Main) { Toast.makeText(this@CameraActivity, "Save failed", Toast.LENGTH_SHORT).show() }
+                    val ok = saveBitmapToGallery(bmp)
+                    withContext(Dispatchers.Main) {
+                        if (ok) Toast.makeText(this@CameraActivity, "Saved warped image", Toast.LENGTH_SHORT).show()
+                        else Toast.makeText(this@CameraActivity, "Save failed", Toast.LENGTH_SHORT).show()
                     }
                 } ?: run {
                     withContext(Dispatchers.Main) { Toast.makeText(this@CameraActivity, "Nothing to save yet", Toast.LENGTH_SHORT).show() }
@@ -110,7 +112,6 @@ class CameraActivity : AppCompatActivity() {
             startCamera()
         }
 
-        // Load model in background
         ioScope.launch { tryLoadMidasInterpreter() }
 
         FileLogger.d(this, TAG, "CameraActivity created")
@@ -139,18 +140,16 @@ class CameraActivity : AppCompatActivity() {
             .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
             .build()
 
-        imageAnalysis.setAnalyzer(cameraExecutor) { image ->
+        imageAnalysis.setAnalyzer(cameraExecutor) { imageProxy ->
             try {
-                val bmp = imageProxyToBitmap(image)
+                val bmp = imageProxyToBitmap(imageProxy)
                 if (bmp != null) {
-                    ioScope.launch {
-                        processFrameAndShow(bmp)
-                    }
+                    ioScope.launch { processFrameAndShow(bmp) }
                 }
             } catch (e: Exception) {
                 FileLogger.e(this, TAG, "Analyzer error: ${e.message}")
             } finally {
-                image.close()
+                imageProxy.close()
             }
         }
 
@@ -172,36 +171,18 @@ class CameraActivity : AppCompatActivity() {
                     return@withContext
                 }
 
-                // Try with XNNPACK enabled first. If any native error happens we will recreate without it.
+                // safer interpreter options (avoid aggressive delegates)
                 val opts = Interpreter.Options().apply {
                     setNumThreads(2)
+                    // try to disable XNNPACK if API available
                     try {
-                        // call setUseXNNPACK(true) if available (some TF versions)
                         val method = Interpreter.Options::class.java.getMethod("setUseXNNPACK", Boolean::class.javaPrimitiveType)
-                        method.invoke(this, true)
+                        method.invoke(this, false)
                     } catch (_: Exception) {
-                        // ignore if not available
                     }
                 }
 
-                try {
-                    midasInterpreter = Interpreter(midasFile, opts)
-                } catch (e: Throwable) {
-                    FileLogger.e(this@CameraActivity, TAG, "MiDaS initial create with XNNPACK failed: ${e.message}. Trying fallback without XNNPACK.")
-                    try {
-                        val opts2 = Interpreter.Options().apply {
-                            setNumThreads(2)
-                            try {
-                                val method = Interpreter.Options::class.java.getMethod("setUseXNNPACK", Boolean::class.javaPrimitiveType)
-                                method.invoke(this, false)
-                            } catch (_: Exception) { }
-                        }
-                        midasInterpreter = Interpreter(midasFile, opts2)
-                    } catch (e2: Throwable) {
-                        FileLogger.e(this@CameraActivity, TAG, "Failed to create MiDaS interpreter: ${e2.message}")
-                        midasInterpreter = null
-                    }
-                }
+                midasInterpreter = Interpreter(midasFile, opts)
 
                 midasInterpreter?.let { interp ->
                     try {
@@ -211,7 +192,7 @@ class CameraActivity : AppCompatActivity() {
                         midasOutputType = interp.getOutputTensor(0).dataType()
                         FileLogger.d(this@CameraActivity, TAG, "Loaded midas.tflite; inShape=${midasInputShape?.contentToString()} inType=$midasInputType outShape=${midasOutputShape?.contentToString()} outType=$midasOutputType")
                     } catch (e: Exception) {
-                        FileLogger.e(this@CameraActivity, TAG, "Loaded MiDaS but failed to read tensor info: ${e.message}")
+                        FileLogger.e(this@CameraActivity, TAG, "Loaded midas but failed to read tensor info: ${e.message}")
                     }
                 }
             } catch (e: Exception) {
@@ -248,12 +229,14 @@ class CameraActivity : AppCompatActivity() {
             val chromaWidth = width / 2
 
             for (row in 0 until chromaHeight) {
-                var col = 0
                 val base = row * rowStride
+                var col = 0
                 while (col < chromaWidth) {
                     val vuPos = base + col * pixelStride
-                    nv21[pos++] = if (vuPos < vBytes.size) vBytes[vuPos] else 0
-                    nv21[pos++] = if (vuPos < uBytes.size) uBytes[vuPos] else 0
+                    val vByte = if (vuPos < vBytes.size) vBytes[vuPos] else 0
+                    val uByte = if (vuPos < uBytes.size) uBytes[vuPos] else 0
+                    if (pos < nv21.size) nv21[pos++] = vByte
+                    if (pos < nv21.size) nv21[pos++] = uByte
                     col++
                 }
             }
@@ -270,18 +253,18 @@ class CameraActivity : AppCompatActivity() {
     }
 
     private suspend fun processFrameAndShow(src: Bitmap) {
-        // throttle model runs: run heavy model only every MIDAS_FRAME_SKIP frames
-        frameCounter = (frameCounter + 1) % MIDAS_FRAME_SKIP
+        // throttle model runs: run heavy model only every 3rd frame
+        frameCounter = (frameCounter + 1) % 3
 
-        // downscale for speed (target width)
+        // downscale for speed (keep consistent small resolution)
         val targetW = 640
         val targetH = (targetW.toFloat() * src.height / src.width).roundToInt()
         val down = Bitmap.createScaledBitmap(src, targetW, targetH, true)
 
-        // get depth (0..1 per pixel) as Array<FloatArray> [h][w]
+        // get depth (0..1)
         val depthNorm = runMidasOrFallback(down, runModel = (frameCounter == 0))
 
-        // compute per-row offsets from depth
+        // compute offsets (row-average)
         val offsets = computeRowOffsetsFromDepth(depthNorm, strength = 36.0f)
 
         val warped = warpBitmapRowShift(down, offsets)
@@ -303,7 +286,7 @@ class CameraActivity : AppCompatActivity() {
             var sum = 0f
             for (x in 0 until w) sum += depth[y][x]
             val avg = sum / w
-            // push far pixels more; map avg(0..1) to offset centered at 0
+            // push far pixels more (avg in 0..1)
             val off = (avg - 0.5f) * 2f * strength
             offsets[y] = off
         }
@@ -319,6 +302,7 @@ class CameraActivity : AppCompatActivity() {
         bmp.getPixels(srcPixels, 0, w, 0, 0, w, h)
 
         for (y in 0 until h) {
+            // pick offset by mapping y across offsets rows
             val offIndex = (y.toFloat() * offsets.size / h).toInt().coerceIn(0, offsets.size - 1)
             val offF = offsets[offIndex]
             val off = offF.roundToInt()
@@ -334,6 +318,7 @@ class CameraActivity : AppCompatActivity() {
                     outPixels[rowStart + x] = srcPixels[rowStart + srcX]
                 }
             } else {
+                // copy fast
                 System.arraycopy(srcPixels, rowStart, outPixels, rowStart, w)
             }
         }
@@ -372,7 +357,7 @@ class CameraActivity : AppCompatActivity() {
         overlayPaint.isFilterBitmap = true
         canvas.drawRect(0f, 0f, w.toFloat(), h.toFloat(), overlayPaint)
 
-        // subtle depth fog (pale bluish)
+        // subtle depth fog
         val fogBitmap = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
         val fogPixels = IntArray(w * h)
         for (y in 0 until h) {
@@ -381,23 +366,20 @@ class CameraActivity : AppCompatActivity() {
             for (x in 0 until w) {
                 val d = row[(x.toFloat() * row.size / w).toInt().coerceIn(0, row.size - 1)]
                 val alpha = (d * 80).toInt().coerceIn(0, 100)
-                // pale bluish fog: ARGB
+                // pale bluish fog color - compose ARGB (alpha in top byte)
                 val fogColor = (alpha shl 24) or (0x008090A0)
                 fogPixels[y * w + x] = fogColor
             }
         }
         fogBitmap.setPixels(fogPixels, 0, w, 0, 0, w, h)
-        val fogPaint = Paint()
-        fogPaint.isFilterBitmap = true
-        fogPaint.alpha = 120
-        canvas.drawBitmap(fogBitmap, 0f, 0f, fogPaint)
+        canvas.drawBitmap(fogBitmap, 0f, 0f, null)
 
         return out
     }
 
     /**
-     * Run MiDaS if available. On any failure return fallback depth based on luma.
-     * Returns normalized depth array [h][w] (0..1).
+     * Run midas if available and if runModel==true (we throttle). If anything fails returns fallback depth.
+     * Returns normalized depth array [h][w] in 0..1.
      */
     private fun runMidasOrFallback(bmp: Bitmap, runModel: Boolean = true): Array<FloatArray> {
         val interp = midasInterpreter
@@ -406,145 +388,126 @@ class CameraActivity : AppCompatActivity() {
         }
 
         try {
-            // Use cached shapes/types when present
+            // read shapes and types (should already be cached)
             val inShape = midasInputShape ?: interp.getInputTensor(0).shape().copyOf()
             val outShape = midasOutputShape ?: interp.getOutputTensor(0).shape().copyOf()
             val inType = midasInputType ?: interp.getInputTensor(0).dataType()
             val outType = midasOutputType ?: interp.getOutputTensor(0).dataType()
 
-            // Expectation: inShape = [1, H, W, C] (from your model dump earlier)
-            val inH = if (inShape.size >= 3) inShape[inShape.size - 3] else bmp.height
-            val inW = if (inShape.size >= 2) inShape[inShape.size - 2] else bmp.width
-            val inC = if (inShape.size >= 4) inShape[inShape.size - 1] else 3
+            // expected: inShape = [1, H, W, C]
+            val inH = inShape[1]
+            val inW = inShape[2]
+            val inC = if (inShape.size >= 4) inShape[3] else 3
 
-            // Resize input to expected
+            // build input buffer
+            val inputByteSize = when (inType) {
+                DataType.UINT8 -> inH * inW * inC
+                DataType.FLOAT32 -> inH * inW * inC * 4
+                else -> inH * inW * inC
+            }
+            val inputBuf = ByteBuffer.allocateDirect(inputByteSize).order(ByteOrder.nativeOrder())
+
+            // resize bmp to model expected size
             val small = Bitmap.createScaledBitmap(bmp, inW, inH, true)
             val pixels = IntArray(inW * inH)
             small.getPixels(pixels, 0, inW, 0, 0, inW, inH)
 
-            // Build flat input primitive array (no nested arrays) for interpreter.run
-            val inputObj: Any = when (inType) {
-                DataType.UINT8 -> {
-                    val arr = ByteArray(inW * inH * inC)
-                    var idx = 0
-                    for (p in pixels) {
-                        arr[idx++] = ((p shr 16) and 0xFF).toByte()
-                        arr[idx++] = ((p shr 8) and 0xFF).toByte()
-                        arr[idx++] = (p and 0xFF).toByte()
-                    }
-                    arr
+            if (inType == DataType.UINT8) {
+                for (p in pixels) {
+                    inputBuf.put(((p shr 16) and 0xFF).toByte())
+                    inputBuf.put(((p shr 8) and 0xFF).toByte())
+                    inputBuf.put((p and 0xFF).toByte())
                 }
-                DataType.FLOAT32 -> {
-                    val arr = FloatArray(inW * inH * inC)
-                    var idx = 0
-                    for (p in pixels) {
-                        arr[idx++] = ((p shr 16) and 0xFF) / 255.0f
-                        arr[idx++] = ((p shr 8) and 0xFF) / 255.0f
-                        arr[idx++] = (p and 0xFF) / 255.0f
-                    }
-                    arr
-                }
-                else -> {
-                    // fallback to float array
-                    val arr = FloatArray(inW * inH * inC)
-                    var idx = 0
-                    for (p in pixels) {
-                        arr[idx++] = ((p shr 16) and 0xFF) / 255.0f
-                        arr[idx++] = ((p shr 8) and 0xFF) / 255.0f
-                        arr[idx++] = (p and 0xFF) / 255.0f
-                    }
-                    arr
+            } else {
+                val fb = inputBuf.asFloatBuffer()
+                for (p in pixels) {
+                    val r = ((p shr 16) and 0xFF) / 255.0f
+                    val g = ((p shr 8) and 0xFF) / 255.0f
+                    val b = (p and 0xFF) / 255.0f
+                    fb.put(r); fb.put(g); fb.put(b)
                 }
             }
+            inputBuf.rewind()
 
-            // Prepare output flat primitive array
-            // outShape frequently like [1, H, W, 1]
-            val outTotal = outShape.fold(1) { acc, i -> acc * i }
-            val outputObj: Any = when (outType) {
-                DataType.UINT8 -> ByteArray(outTotal)
-                DataType.FLOAT32 -> FloatArray(outTotal)
-                else -> FloatArray(outTotal)
+            // prepare output buffer based on output shape
+            val outDims = outShape
+            val outTotal = outDims.fold(1) { acc, i -> acc * i }
+            val outputByteSize = when (outType) {
+                DataType.UINT8 -> outTotal
+                DataType.FLOAT32 -> outTotal * 4
+                else -> outTotal
             }
+            val outputBuf = ByteBuffer.allocateDirect(outputByteSize).order(ByteOrder.nativeOrder())
 
-            // Run model; catch exceptions and attempt safe retry without XNNPACK
+            // invoke
             try {
-                interp.run(inputObj, outputObj)
-            } catch (invokeEx: Throwable) {
+                outputBuf.rewind()
+                interp.run(inputBuf, outputBuf)
+            } catch (invokeEx: Exception) {
                 val now = System.currentTimeMillis()
                 if (now - lastMidasErrorLogTime > MIDAS_ERROR_LOG_SUPPRESS_MS) {
                     FileLogger.e(this, TAG, "Midas run failed (invoke): ${invokeEx.message}")
                     lastMidasErrorLogTime = now
                 }
-                // Try a one-off recreate without XNNPACK
-                try {
-                    FileLogger.d(this, TAG, "Midas run: recreating interpreter without XNNPACK and retrying")
-                    try { interp.close() } catch (_: Exception) {}
-                    midasInterpreter = null
-                    val mfile = File(filesDir, "models/midas.tflite")
-                    val altOpts = Interpreter.Options().apply {
-                        setNumThreads(1)
-                        try {
-                            val method = Interpreter.Options::class.java.getMethod("setUseXNNPACK", Boolean::class.javaPrimitiveType)
-                            method.invoke(this, false)
-                        } catch (_: Exception) {}
-                    }
-                    midasInterpreter = Interpreter(mfile, altOpts)
-                    // refresh cached metadata
-                    midasInputShape = midasInterpreter?.getInputTensor(0)?.shape()?.copyOf()
-                    midasOutputShape = midasInterpreter?.getOutputTensor(0)?.shape()?.copyOf()
-                    midasInputType = midasInterpreter?.getInputTensor(0)?.dataType()
-                    midasOutputType = midasInterpreter?.getOutputTensor(0)?.dataType()
-
-                    midasInterpreter?.run(inputObj, outputObj)
-                } catch (retryEx: Throwable) {
-                    FileLogger.e(this, TAG, "Midas retry failed: ${retryEx.message}")
-                    return fallbackDepthFromLuma(bmp)
-                }
+                // fallback to simple luminance
+                return fallbackDepthFromLuma(bmp)
             }
 
-            // Convert flat output primitive array into 2D normalized float array [h][w]
-            val (outH, outW) = if (outShape.size >= 3) {
-                Pair(outShape[outShape.size - 3], outShape[outShape.size - 2])
-            } else {
-                Pair(inH, inW)
-            }
-            val outChannels = if (outShape.size >= 4) outShape[outShape.size - 1] else 1
-            val flatFloat = FloatArray(outH * outW * outChannels)
+            // read output buffer and normalize to 0..1 array
+            outputBuf.rewind()
+            val outH = outDims[1]
+            val outW = outDims[2]
+            val outArr = Array(outH) { FloatArray(outW) }
 
-            when (outputObj) {
-                is ByteArray -> {
-                    for (i in outputObj.indices) {
-                        flatFloat[i] = (outputObj[i].toInt() and 0xFF) / 255.0f
+            if (outType == DataType.FLOAT32) {
+                val fb = outputBuf.asFloatBuffer()
+                val tmp = FloatArray(outH * outW)
+                fb.get(tmp)
+                var idx = 0
+                var min = Float.MAX_VALUE
+                var max = -Float.MAX_VALUE
+                for (y in 0 until outH) {
+                    for (x in 0 until outW) {
+                        val v = tmp[idx++]
+                        if (v < min) min = v
+                        if (v > max) max = v
+                        outArr[y][x] = v
                     }
                 }
-                is FloatArray -> {
-                    for (i in outputObj.indices) flatFloat[i] = outputObj[i]
+                val rng = (max - min).coerceAtLeast(1e-6f)
+                for (y in 0 until outH) for (x in 0 until outW) outArr[y][x] = (outArr[y][x] - min) / rng
+            } else if (outType == DataType.UINT8) {
+                val bytes = ByteArray(outH * outW)
+                outputBuf.get(bytes)
+                var idx = 0
+                var min = 255
+                var max = 0
+                for (y in 0 until outH) {
+                    for (x in 0 until outW) {
+                        val v = bytes[idx++].toInt() and 0xFF
+                        if (v < min) min = v
+                        if (v > max) max = v
+                        outArr[y][x] = v.toFloat()
+                    }
                 }
-                else -> {
-                    // fallback
-                    for (i in flatFloat.indices) flatFloat[i] = 0.5f
-                }
-            }
-
-            // pick first channel and reshape to [outH][outW]
-            val out2d = Array(outH) { FloatArray(outW) }
-            for (y in 0 until outH) {
-                for (x in 0 until outW) {
-                    val base = (y * outW + x) * outChannels
-                    out2d[y][x] = flatFloat.getOrElse(base) { 0.5f }
-                }
-            }
-
-            // If model output size differs from requested (rare) resample by nearest
-            if (outH == inH && outW == inW) {
-                return out2d
+                val rng = (max - min).coerceAtLeast(1)
+                for (y in 0 until outH) for (x in 0 until outW) outArr[y][x] = (outArr[y][x] - min) / rng.toFloat()
             } else {
-                val resized = Array(inH) { FloatArray(inW) }
-                for (y in 0 until inH) {
-                    val sy = (y.toFloat() * outH / inH).toInt().coerceIn(0, outH - 1)
-                    for (x in 0 until inW) {
-                        val sx = (x.toFloat() * outW / inW).toInt().coerceIn(0, outW - 1)
-                        resized[y][x] = out2d[sy][sx]
+                // unknown type, fallback
+                return fallbackDepthFromLuma(bmp)
+            }
+
+            // if model output differs from requested (resample to bmp h/w)
+            if (outH == bmp.height && outW == bmp.width) {
+                return outArr
+            } else {
+                // nearest-resample from outArr to target size (bmp.width,bmp.height)
+                val resized = Array(bmp.height) { FloatArray(bmp.width) }
+                for (y in 0 until bmp.height) {
+                    val sy = (y.toFloat() * outH / bmp.height).toInt().coerceIn(0, outH - 1)
+                    for (x in 0 until bmp.width) {
+                        val sx = (x.toFloat() * outW / bmp.width).toInt().coerceIn(0, outW - 1)
+                        resized[y][x] = outArr[sy][sx]
                     }
                 }
                 return resized
@@ -559,7 +522,7 @@ class CameraActivity : AppCompatActivity() {
         }
     }
 
-    // Simple fallback: use normalized luminance as depth (0..1)
+    // Simple fallback: use normalized luminance as depth
     private fun fallbackDepthFromLuma(bmp: Bitmap): Array<FloatArray> {
         val w = bmp.width
         val h = bmp.height
@@ -574,7 +537,7 @@ class CameraActivity : AppCompatActivity() {
                 val g = ((p shr 8) and 0xFF)
                 val b = (p and 0xFF)
                 val l = (0.299f * r + 0.587f * g + 0.114f * b) / 255.0f
-                // invert l so bright -> near (0), dark -> far (1) (adjust to taste)
+                // invert l so bright -> near (0), dark -> far (1)
                 out[y][x] = 1.0f - l
             }
         }
@@ -584,26 +547,64 @@ class CameraActivity : AppCompatActivity() {
     private fun saveBitmapToGallery(bmp: Bitmap): Boolean {
         return try {
             val filename = "twisted_warp_${System.currentTimeMillis()}.jpg"
-            val fos: OutputStream?
             val resolver = contentResolver
             val contentValues = ContentValues().apply {
                 put(MediaStore.MediaColumns.DISPLAY_NAME, filename)
                 put(MediaStore.MediaColumns.MIME_TYPE, "image/jpeg")
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                     put(MediaStore.MediaColumns.RELATIVE_PATH, "Pictures/TwistedPhone")
+                    put(MediaStore.Images.Media.IS_PENDING, 1)
                 }
             }
+
             val imageUri: Uri? = resolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, contentValues)
-            fos = imageUri?.let { resolver.openOutputStream(it) }
-            fos?.use {
-                bmp.compress(Bitmap.CompressFormat.JPEG, 92, it)
-                it.flush()
+            if (imageUri == null) {
+                FileLogger.e(this, TAG, "resolver.insert returned null")
+                return false
             }
-            true
+
+            var succeeded = false
+            resolver.openOutputStream(imageUri)?.use { out: OutputStream ->
+                succeeded = bmp.compress(Bitmap.CompressFormat.JPEG, 92, out)
+                out.flush()
+            }
+
+            if (succeeded && Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                contentValues.clear()
+                contentValues.put(MediaStore.Images.Media.IS_PENDING, 0)
+                resolver.update(imageUri, contentValues, null, null)
+            }
+
+            succeeded
         } catch (e: Exception) {
             FileLogger.e(this, TAG, "Save failed: ${e.message}")
             false
         }
+    }
+
+    private fun takePictureUsingImageCapture() {
+        val ic = imageCapture ?: run {
+            Toast.makeText(this, "Capture not ready", Toast.LENGTH_SHORT).show()
+            return
+        }
+        val name = "twisted_${System.currentTimeMillis()}"
+        val contentValues = ContentValues().apply {
+            put(MediaStore.MediaColumns.DISPLAY_NAME, name)
+            put(MediaStore.MediaColumns.MIME_TYPE, "image/jpeg")
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) put(MediaStore.Images.Media.RELATIVE_PATH, "Pictures/TwistedPhone")
+        }
+        val outOptions = ImageCapture.OutputFileOptions.Builder(contentResolver, MediaStore.Images.Media.EXTERNAL_CONTENT_URI, contentValues).build()
+        ic.takePicture(outOptions, ContextCompat.getMainExecutor(this), object: ImageCapture.OnImageSavedCallback {
+            override fun onImageSaved(outputFileResults: ImageCapture.OutputFileResults) {
+                val uri = outputFileResults.savedUri
+                FileLogger.d(this@CameraActivity, TAG, "Saved photo: $uri")
+                Toast.makeText(this@CameraActivity, "Saved: $uri", Toast.LENGTH_SHORT).show()
+            }
+            override fun onError(exception: ImageCaptureException) {
+                FileLogger.e(this@CameraActivity, TAG, "Capture failed: ${exception.message}")
+                Toast.makeText(this@CameraActivity, "Capture failed: ${exception.message}", Toast.LENGTH_SHORT).show()
+            }
+        })
     }
 
     override fun onDestroy() {
