@@ -1,0 +1,81 @@
+package com.twistedphone.tflite
+
+import android.content.Context
+import com.twistedphone.util.FileLogger
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import org.tensorflow.lite.Interpreter
+import java.nio.FloatBuffer
+
+object MobileSamMapper {
+    private const val TAG = "MobileSamMapper"
+
+    /**
+     * Heuristically try to map common decoder input names to indices and attempt a dry-run with zeroed inputs.
+     * Returns a textual report you can paste here.
+     */
+    suspend fun probeDecoder(context: Context, decoder: Interpreter): String = withContext(Dispatchers.IO) {
+        val sb = StringBuilder()
+        try {
+            val nIn = decoder.inputTensorCount
+            val inMap = mutableMapOf<Int, String>()
+            for (i in 0 until nIn) {
+                try {
+                    val t = decoder.getInputTensor(i)
+                    inMap[i] = (t.name() ?: "<noname>").lowercase()
+                } catch (e: Exception) {
+                    inMap[i] = "<err:${e.message}>"
+                }
+            }
+            sb.appendLine("Decoder input count: $nIn")
+            for ((i, name) in inMap) sb.appendLine("  [$i] => $name")
+
+            // Build a candidate input array of nulls and zeroed buffers according to shapes
+            val inputs = arrayOfNulls<Any>(nIn)
+            for (i in 0 until nIn) {
+                try {
+                    val t = decoder.getInputTensor(i)
+                    val shape = t.shape()
+                    val size = shape.fold(1) { a, b -> a * b }
+                    val dt = t.dataType()
+                    // supply zeros according to dtype
+                    when (dt) {
+                        org.tensorflow.lite.DataType.FLOAT32 -> inputs[i] = FloatArray(size) { 0f }
+                        org.tensorflow.lite.DataType.UINT8 -> inputs[i] = ByteArray(size) { 0 }
+                        org.tensorflow.lite.DataType.INT32 -> inputs[i] = IntArray(size) { 0 }
+                        else -> inputs[i] = FloatArray(size) { 0f }
+                    }
+                } catch (e: Exception) {
+                    sb.appendLine("  failed to prepare input[$i]: ${e.message}")
+                }
+            }
+
+            // prepare outputs (only try to allocate for output[0] so we can run a quick test)
+            val outCount = decoder.outputTensorCount
+            val outputs = HashMap<Int, Any>()
+            if (outCount > 0) {
+                try {
+                    val t0 = decoder.getOutputTensor(0)
+                    val outShape = t0.shape()
+                    val outSize = outShape.fold(1) { a, b -> a * b }
+                    val outBuf = FloatArray(outSize)
+                    outputs[0] = outBuf
+                } catch (_: Exception) {}
+            }
+
+            sb.appendLine("Attempting decoder.runForMultipleInputsOutputs with zeroed inputs/outputs (test).")
+            try {
+                decoder.runForMultipleInputsOutputs(inputs, outputs)
+                sb.appendLine("Decoder test run: SUCCESS")
+            } catch (e: Exception) {
+                sb.appendLine("Decoder test run: FAILED -> ${e.message}")
+            }
+        } catch (e: Exception) {
+            sb.appendLine("probeDecoder exception: ${e.message}")
+        }
+
+        val report = sb.toString()
+        FileLogger.d(context, TAG, report)
+        return@withContext report
+    }
+}
